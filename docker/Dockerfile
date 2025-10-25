@@ -1,6 +1,7 @@
 FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
-ENV DEBIAN_FRONTEND=noninteractive \
+ENV PATH="/opt/conda/bin:${PATH}" \
+	DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
@@ -50,7 +51,7 @@ RUN pip install --upgrade pip setuptools wheel && \
 WORKDIR /opt
 RUN git clone --recursive https://github.com/cvg/Hierarchical-Localization hloc
 WORKDIR /opt/hloc
-RUN pip install --no-build-isolation -e . 
+RUN /opt/conda/bin/pip install --no-build-isolation -e . 
 
 # 預設工作目錄
 WORKDIR /workspace
@@ -62,6 +63,7 @@ WORKDIR /workspace
 RUN useradd -m -s /bin/bash developer
 # 讓 developer 可以免密碼 sudo
 RUN echo "developer ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+RUN echo 'export PATH=/opt/conda/bin:$PATH' >> /etc/profile.d/conda_path.sh
 
 # 3. 準備 SSH 設定
 RUN mkdir -p /home/developer/.ssh
@@ -80,3 +82,5 @@ EXPOSE 22
 
 # 5. 使用啟動腳本來啟動容器
 CMD ["/entrypoint.sh"]
+
+# docker run -itd --name hloc -p 8022:22 --gpus all --shm-size 2g -v <hloc_project>:/workspace -e DEVELOPER_PUBLIC_KEY="ssh-rsa AAA..." hloc

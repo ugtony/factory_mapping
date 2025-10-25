@@ -1,5 +1,5 @@
 #!/bin/bash
-# . /entrypoint.sh
+export PATH=/opt/conda/bin:$PATH
 
 # 檢查是否有提供公鑰
 if [ -z "$DEVELOPER_PUBLIC_KEY" ]; then
