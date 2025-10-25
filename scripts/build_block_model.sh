@@ -89,10 +89,11 @@ ${PY} -m hloc.extract_features --conf "${GLOBAL_CONF}" \
 
 # -------- 4) 產 pairs（DB 自檢索）--------
 echo "[3/5] Building retrieval pairs…"
-${PY} -m hloc.pairs_from_retrieval \
-  --query_list "${DB_LIST}" --db_list "${DB_LIST}" \
-  --descriptors "${GLOBAL_FEATS}" --db_descriptors "${GLOBAL_FEATS}" \
-  --num_matched ${NUM_DB_PAIRS} \
+python3 scripts/pairs_from_retrieval_and_sequential.py \
+  --db_list "${DB_LIST}" \
+  --global_feats "${GLOBAL_FEATS}" \
+  --num_retrieval 5 \
+  --seq_window 5 \
   --output "${PAIRS_DB}"
 
 # -------- 4.1) 潔淨化 pairs：僅保留存在於 H5 且有 keypoints 的影像 --------
