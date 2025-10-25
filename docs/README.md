@@ -140,3 +140,11 @@ bash scripts/build_block_model.sh data/block_001
 
 # Step 2. 在 runtime 中進行定位
 python runtime/run_localization.py --query query.jpg --wifi wifi_scan.json
+
+### 可視化單一 Block SfM 結果
+python scripts/visualize_sfm_open3d.py \
+  --sfm_dir outputs-hloc/block_001/sfm \
+  --output_dir outputs-hloc/block_001/visualization \
+  --query_poses outputs-hloc/block_001/poses.txt \
+  --no_server
+```

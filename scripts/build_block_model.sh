@@ -165,3 +165,30 @@ ${PY} -m hloc.reconstruction \
 
 echo "✅ Done: ${BLOCK_NAME}"
 echo "SfM model stored at: ${SFM_DIR}"
+
+# -------- 8) 視覺化：匯出互動式 HTML（不開 server）--------
+VIZ_SCRIPT="${PROJECT_ROOT}/scripts/visualize_sfm_open3d.py"
+if [ -f "${VIZ_SCRIPT}" ]; then
+  echo "[Viz] Export interactive HTML..."
+  VIZ_ARGS=( --sfm_dir "${SFM_DIR}" --output_dir "${VIZ_DIR}" --no_server )
+
+  # 若該 block 已有 poses.txt，則一起畫出 Query 相機
+  if [ -f "${OUT_DIR}/poses.txt" ]; then
+    VIZ_ARGS+=( --query_poses "${OUT_DIR}/poses.txt" )
+  fi
+
+  # 可用環境變數啟動內建 HTTP 伺服器（預設關閉）
+  # 例： START_SERVER=1 PORT=18080 bash scripts/build_block_model.sh data/xxx
+  if [ "${START_SERVER:-0}" = "1" ]; then
+    VIZ_ARGS=( --sfm_dir "${SFM_DIR}" --output_dir "${VIZ_DIR}" --port "${PORT:-8080}" )
+    # 如有 poses 一樣附上
+    if [ -f "${OUT_DIR}/poses.txt" ]; then
+      VIZ_ARGS+=( --query_poses "${OUT_DIR}/poses.txt" )
+    fi
+  fi
+
+  "${PY}" "${VIZ_SCRIPT}" "${VIZ_ARGS[@]}"
+  echo "[Viz] HTML exported to: ${VIZ_DIR}/sfm_view.html"
+else
+  echo "[Viz] Skip: ${VIZ_SCRIPT} not found"
+fi
