@@ -8,7 +8,7 @@ ENV PATH="/opt/conda/bin:${PATH}" \
 # 安裝 SSH 伺服器和基本工具
 RUN apt-get update && apt-get install -y \
     openssh-server sudo \
-    git curl wget tree \
+    vim zip net-tools git curl wget tree \
     python3-pip \
     # --- 在此加入您想提供的所有工具 ---
     && apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -36,6 +36,7 @@ RUN pip install --upgrade pip setuptools wheel && \
     pycolmap \
 	open3d \
     opencv-python \
+    pillow-heif \
     kornia \
     matplotlib \
     scipy \
