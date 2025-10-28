@@ -49,7 +49,7 @@ echo "-------------------------------------"
 GLOBAL_CONF="netvlad"
 LOCAL_CONF="superpoint_aachen"
 MATCHER_CONF="superpoint+lightglue"
-NUM_Q_PAIRS=5   # 每個 query 影像要檢索 K 張最像的 DB 影像
+NUM_Q_PAIRS=10   # 每個 query 影像要檢索 K 張最像的 DB 影像
 
 # --- 3. 檔案路徑定義 ---
 
