@@ -318,7 +318,7 @@ def main(sfm_dir, output_dir, port=8080, query_poses=None, no_server=False):
                 up=dict(x=0, y=0, z=1),
                 
                 # 2. 設置一個合理的初始視角
-                eye=dict(x=1.5, y=1.5, z=0.5) 
+                eye=dict(x=-0.5, y=-2.5, z=0.5) 
             ),
             
             # 3. 更改滑鼠旋轉模式為 "orbit"
