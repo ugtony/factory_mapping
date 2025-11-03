@@ -51,6 +51,15 @@ MATCHER_CONF="superpoint+lightglue"
 USE_STAGE="${USE_STAGE:-1}"         # 1=使用 staging；0=直接用 ${DATA_DIR}/db
 REBUILD_SFM="${REBUILD_SFM:-0}"     # 1=每次重建 SfM 目錄；0=沿用
 ALIGN_SFM="${ALIGN_SFM:-1}"         # 1=執行 Z-Up 對齊；0=跳過
+NUM_RETRIEVAL="${NUM_RETRIEVAL:-0}" # 檢索配對數
+SEQ_WINDOW="${SEQ_WINDOW:-5}"       # 時序配對窗口
+
+# NUM_RETRIEVAL 和 SEQ_WINDOW 不能同時為 0
+if [ "${NUM_RETRIEVAL}" -le 0 ] && [ "${SEQ_WINDOW}" -le 0 ]; then
+  echo "[Error] NUM_RETRIEVAL and SEQ_WINDOW cannot both be 0."
+  echo "        At least one must be > 0 for pair generation."
+  exit 1
+fi
 
 # -------- 3. 核心檔案路徑 --------
 DB_LIST="${OUT_DIR}/db.txt"
@@ -111,8 +120,8 @@ else
   ${PY} "${PROJECT_ROOT}/scripts/pairs_from_retrieval_and_sequential.py" \
     --db_list "${DB_LIST}" \
     --global_feats "${GLOBAL_FEATS}" \
-    --num_retrieval 5 \
-    --seq_window 5 \
+    --num_retrieval "${NUM_RETRIEVAL}" \
+    --seq_window "${SEQ_WINDOW}" \
     --output "${PAIRS_DB}"
 fi
 
