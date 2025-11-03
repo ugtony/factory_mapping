@@ -88,9 +88,12 @@ def load_query_poses(path):
             name = toks[0]
             q = np.array(list(map(float, toks[1:5])), dtype=np.float64)
             t = np.array(list(map(float, toks[5:8])), dtype=np.float64)
-            R = qvec2rotmat(q)       # world_R_cam
-            C = -R.T @ t             # 相機中心（世界座標）
-            poses.append((name, C, R))
+            R_c_w = qvec2rotmat(q)     # 這是 world-to-cam 旋轉 (R_c_w)
+            R_w_c = R_c_w.T          # 轉置得到 cam-to-world (R_w_c)
+            C = -R_c_w.T @ t         # 計算相機中心 C_w (這行不變)
+            poses.append((name, C, R_w_c)) # <--- 傳入 R_w_c (修正後的 R)
+    print(f"[Info] Loaded {len(poses)} query poses from {path}.")
+    return poses
     print(f"[Info] Loaded {len(poses)} query poses from {path}.")
     return poses
 

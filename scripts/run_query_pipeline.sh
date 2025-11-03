@@ -258,7 +258,7 @@ export LOCAL_FEATS="${LOCAL_FEATS_H5}"
 export Q_MATCHES="${Q_MATCHES_H5}"
 export MAX_VIZ_IMAGES_LOCALIZATION=5
 ${PY} - <<'PY'
-import os, h5py, numpy as np
+import os, h5py, numpy as np, random
 from pathlib import Path
 from PIL import Image
 import matplotlib; matplotlib.use("Agg")
@@ -279,7 +279,9 @@ with open(PAIRS_Q2DB, "r") as f:
         if len(p) >= 2:
             q, db = p[0], p[1]
             if q not in q2db_top1: q2db_top1[q] = db
-def draw_matches(q, db, pts_q, pts_db, out_path):
+
+# --- [修改 1] 抽樣前的總數 original_match_count ---
+def draw_matches(q, db, pts_q, pts_db, out_path, original_match_count):
     im_q = np.array(Image.open(DATA_ROOT / q).convert("RGB"))
     im_db = np.array(Image.open(DATA_ROOT / db).convert("RGB"))
     H = max(im_q.shape[0], im_db.shape[0])
@@ -288,10 +290,36 @@ def draw_matches(q, db, pts_q, pts_db, out_path):
     canvas[:im_db.shape[0], im_q.shape[1]:] = im_db
     fig = plt.figure(figsize=(12,6)); ax = fig.add_subplot(1,1,1)
     ax.imshow(canvas); ax.axis('off'); shift_x = im_q.shape[1]
-    for (x1,y1),(x2,y2) in zip(pts_q, pts_db):
-        ax.plot([x1, x2+shift_x], [y1, y2], linewidth=0.5)
-    ax.set_title(f"{q} ↔ {db} (matches={len(pts_q)})")
+    
+    # 抽樣後的數量 (用於迴圈)
+    num_matches_sampled = len(pts_q)
+    
+    if num_matches_sampled > 0:
+        line_width = 0.5 
+        circle_size = 5    
+        line_alpha = 0.6
+        
+        N = num_matches_sampled
+        colors = plt.cm.get_cmap('turbo', N)(np.linspace(0, 1, N))
+        
+        for i in range(N):
+            color = colors[i]
+            (x1, y1) = pts_q[i]
+            (x2, y2) = pts_db[i]
+            
+            ax.plot([x1, x2 + shift_x], [y1, y2], 
+                    linewidth=line_width, color=color, alpha=line_alpha)
+            
+            ax.scatter(x1, y1, 
+                       s=circle_size, color=color, marker='o', alpha=line_alpha + 0.2)
+                       
+            ax.scatter(x2 + shift_x, y2, 
+                       s=circle_size, color=color, marker='o', alpha=line_alpha + 0.2)
+
+    # --- [修改 2] 使用 original_match_count 來設定標題 ---
+    ax.set_title(f"{q} ↔ {db} (matches={original_match_count})")
     fig.savefig(out_path, bbox_inches='tight', dpi=160); plt.close(fig)
+
 with h5py.File(str(LOCAL_FEATS), 'r') as ffeat, h5py.File(str(Q_MATCHES), 'r') as fmat:
     matches_nodes = []
     def visit(name, obj):
@@ -317,14 +345,37 @@ with h5py.File(str(LOCAL_FEATS), 'r') as ffeat, h5py.File(str(Q_MATCHES), 'r') a
         if found is None:
             print(f"[Skip] 找不到 ({q}, {db}) 的 matches0 dataset")
             continue
+        
         m0 = np.array(fmat[found])
         kpts_q = np.array(ffeat[q]['keypoints']); kpts_db= np.array(ffeat[db]['keypoints'])
+        
         valid = m0 > -1
         if valid.sum() == 0: pts_q = np.empty((0,2)); pts_db = np.empty((0,2))
-        else: idx_q = np.where(valid)[0]; idx_db = m0[valid]; pts_q = kpts_q[idx_q][:, :2]; pts_db = kpts_db[idx_db][:, :2]
+        else: 
+            idx_q = np.where(valid)[0]
+            idx_db = m0[valid]
+            pts_q = kpts_q[idx_q][:, :2]
+            pts_db = kpts_db[idx_db][:, :2]
+        
+        # [改善] 隨機抽樣匹配點對，避免線條過密
+        MAX_LINES_TO_DRAW = 200
+        
+        # --- [修改 3] 儲存抽樣前的總數 ---
+        num_matches_original = len(pts_q)
+        
+        if num_matches_original > MAX_LINES_TO_DRAW:
+            indices = random.sample(range(num_matches_original), MAX_LINES_TO_DRAW)
+            pts_q = pts_q[indices] # pts_q 變成抽樣後的
+            pts_db = pts_db[indices]
+            
         out = VIZ_DIR / (Path(q).stem.replace('/', '_') + "_matches.jpg")
-        try: draw_matches(q, db, pts_q, pts_db, out); done += 1
-        except Exception as e: print(f"[Warn] 繪製 {q} 失敗: {e}")
+        try: 
+            # --- [修改 4] 將抽樣前的總數傳入 ---
+            draw_matches(q, db, pts_q, pts_db, out, num_matches_original)
+            done += 1
+        except Exception as e: 
+            print(f"[Warn] 繪製 {q} 失敗: {e}")
+            
         if done >= MAXV: break
 print(f"[Localization Viz] 寫入 {done} 張圖片到 {VIZ_DIR}")
 PY
@@ -340,7 +391,7 @@ if [ -f "${VIZ_PY_SCRIPT}" ]; then
     --query_poses "${RESULTS_TXT}" \
     --no_server
 else
-  echo "[Warn] 找不到 ${VIZ_PY_SCRIPT}。跳過 HTML 視覺化。"
+  echo "[Warn] Noy ${VIZ_PY_SCRIPT}。跳過 HTML 視覺化。"
 fi
 
 # --- 最終總結 ---
