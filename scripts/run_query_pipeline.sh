@@ -58,6 +58,7 @@ GLOBAL_CONF="netvlad"
 LOCAL_CONF="superpoint_aachen"
 MATCHER_CONF="superpoint+lightglue"
 NUM_Q_PAIRS=10   # 每個 query 影像檢索 K 張最像的 DB 影像
+VIZ_MODE="${VIZ_MODE:-std}"  # 預設為 std，可透過環境變數 VIZ_MODE=360 覆蓋
 
 # --- 3. 檔案路徑定義 ---
 # 已存在（build_block_model.sh 產生）
@@ -384,12 +385,13 @@ PY
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIZ_PY_SCRIPT="${SCRIPT_DIR}/visualize_sfm_open3d.py"
 if [ -f "${VIZ_PY_SCRIPT}" ]; then
-  echo "匯出互動式 HTML (包含 query 相機)..."
+  echo "匯出互動式 HTML (包含 query 相機, mode=${VIZ_MODE})..."
   ${PY} "${VIZ_PY_SCRIPT}" \
     --sfm_dir "${SFM_DIR}" \
     --output_dir "${VIZ_DIR}" \
     --query_poses "${RESULTS_TXT}" \
-    --no_server
+    --no_server \
+    --mode "${VIZ_MODE}"
 else
   echo "[Warn] Noy ${VIZ_PY_SCRIPT}。跳過 HTML 視覺化。"
 fi

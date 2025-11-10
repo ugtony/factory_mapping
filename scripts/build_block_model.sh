@@ -1,26 +1,22 @@
 #!/usr/bin/env bash
-# build_block_model.sh
-# 針對單一 block 區域執行離線建模（HLOC pipeline）。
-#
-# [V4 最終修正]
-# - Fix FOV check: 使用 awk -v 確保數值比較正確 (解決 100.0 沒觸發的問題)。
-# - Fix Matcher call: 確保使用 Python API 傳遞 Path 物件 (解決 ValueError)。
+# build_block_model.sh [V6]
+# - Update: 根據實測結果調整 360 模式的智慧 FOV 預設值 (4view->120, 8view->100)。
 
 set -euo pipefail
 
 # -------- 0. 參數解析 --------
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=100.0] [...]"
+  echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=FLOAT] [...]"
   exit 1
 fi
 
 DATA_DIR="$(realpath "$1")"
 shift
 
-# 預設參數
+# 預設參數 (FOV 設為特殊值以判斷使用者是否輸入)
 CAM_MODE="std"
 DENSE_360=0
-FOV_360=100.0
+FOV_360="AUTO" 
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -31,6 +27,15 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# [V6] 智慧 FOV 預設值邏輯
+if [ "${CAM_MODE}" = "360" ] && [ "${FOV_360}" = "AUTO" ]; then
+  if [ "${DENSE_360}" = "1" ]; then
+    FOV_360=100.0  # 8視角，100度已有足夠重疊
+  else
+    FOV_360=120.0  # 4視角，需120度確保足夠重疊
+  fi
+fi
 
 # -------- 1. 路徑與環境設定 --------
 BLOCK_NAME="$(basename "${DATA_DIR}")"
@@ -48,6 +53,10 @@ if [ -x "/opt/conda/bin/python" ]; then PY="/opt/conda/bin/python"; else PY="${P
 
 echo "========================================"
 echo "[Info] Block: ${BLOCK_NAME} | Mode: ${CAM_MODE^^}"
+if [ "${CAM_MODE}" = "360" ]; then
+  [ "${DENSE_360}" = "1" ] && V_TYPE="Dense(8)" || V_TYPE="Sparse(4)"
+  echo "[Info] 360 Settings: ${V_TYPE}, FOV=${FOV_360}"
+fi
 echo "[Info] Output: ${OUT_DIR}"
 echo "========================================"
 
@@ -127,10 +136,8 @@ echo "[5] Building DB pairs..."
 if [ "${CAM_MODE}" = "360" ]; then
   echo "    > [360 Mode] Using explicit geometric pairing..."
   PAIRS_ARGS=( "--db_list" "${DB_LIST}" "--output" "${PAIRS_DB}" "--seq_window" "${SEQ_WINDOW}" )
-  
-  # [Fix V4] 使用 awk -v 確保數值比較正確
+  # V4 Fix: 使用 awk -v 確保數值比較正確
   IS_FOV_GT_90=$(awk -v f="${FOV_360}" 'BEGIN {print (f > 90 ? 1 : 0)}')
-  
   if [ "${IS_FOV_GT_90}" -eq 1 ]; then
       echo "      - FOV > 90 (${FOV_360}), enabling intra-frame matching."
       PAIRS_ARGS+=( "--intra_match" )
@@ -165,7 +172,7 @@ PY
 PAIRS_USE="${PAIRS_DB_CLEAN}"
 
 echo "[7] Matching DB pairs (${MATCHER_CONF})..."
-# [Fix V4] 強制使用 Python API 呼叫，避免 CLI 路徑解析錯誤
+# V4 Fix: 使用 Python API
 ${PY} - <<PY
 from pathlib import Path
 from hloc import match_features
@@ -195,12 +202,32 @@ else
     --sfm_dir "${SFM_DIR}" | tee "${LOG_DIR}/reconstruction.log"
 fi
 
+# V5 Fix: 完整的最大模型選擇邏輯
 echo "[9] Verifying SfM model..."
-ROOT_IMG_COUNT=0
+NEED_SWAP=false; BEST_MODEL_PATH=""; MAX_IMG_COUNT=0; ROOT_IMG_COUNT=0
 if [ -f "${SFM_DIR}/images.bin" ]; then
     ROOT_IMG_COUNT=$(${PY} -c "import pycolmap, sys; print(len(pycolmap.Reconstruction(sys.argv[1]).images))" "${SFM_DIR}" 2>/dev/null || echo 0)
+else
+    echo "    [Warn] No images.bin in root. Searching models/..."
 fi
-echo "    > Root model has ${ROOT_IMG_COUNT} images."
+if [ -d "${SFM_MODELS_DIR}" ]; then
+  for MODEL_DIR in "${SFM_MODELS_DIR}"/*; do
+    if [ -d "${MODEL_DIR}" ] && [ -f "${MODEL_DIR}/images.bin" ]; then
+      CNT=$(${PY} -c "import pycolmap, sys; print(len(pycolmap.Reconstruction(sys.argv[1]).images))" "${MODEL_DIR}" 2>/dev/null || echo 0)
+      if [ "${CNT}" -gt "${MAX_IMG_COUNT}" ]; then MAX_IMG_COUNT="${CNT}"; BEST_MODEL_PATH="${MODEL_DIR}"; fi
+    fi
+  done
+fi
+if [ "${ROOT_IMG_COUNT}" -lt "${MAX_IMG_COUNT}" ] && [ -n "${BEST_MODEL_PATH}" ]; then
+  echo "    [Fix] Swapping root (${ROOT_IMG_COUNT}) with best (${MAX_IMG_COUNT}) from ${BEST_MODEL_PATH##*/}..."
+  TMP="${SFM_DIR}/_swap"; mkdir -p "${TMP}"
+  find "${SFM_DIR}" -maxdepth 1 -type f -name "*.bin" -exec mv {} "${TMP}/" \;
+  find "${BEST_MODEL_PATH}" -maxdepth 1 -type f -name "*.bin" -exec mv {} "${SFM_DIR}/" \;
+  find "${TMP}" -maxdepth 1 -type f -name "*.bin" -exec mv {} "${BEST_MODEL_PATH}/" \;
+  rm -rf "${TMP}"; ROOT_IMG_COUNT=${MAX_IMG_COUNT}
+else
+  echo "    > Selection OK (Root: ${ROOT_IMG_COUNT}, Max: ${MAX_IMG_COUNT})."
+fi
 
 echo "[10] Align to Z-Up & Visualize"
 if [ "${ALIGN_SFM}" = "1" ] && [ "${ROOT_IMG_COUNT}" -gt 2 ]; then
@@ -210,7 +237,12 @@ else
   FINAL_SFM="${SFM_DIR}"
 fi
 if [ -f "${VIZ_SCRIPT}" ] && [ -d "${FINAL_SFM}" ]; then
-  "${PY}" "${VIZ_SCRIPT}" --sfm_dir "${FINAL_SFM}" --output_dir "${VIZ_DIR}" --no_server >/dev/null
+  # [Fix] 傳遞 CAM_MODE 給視覺化腳本
+  "${PY}" "${VIZ_SCRIPT}" \
+    --sfm_dir "${FINAL_SFM}" \
+    --output_dir "${VIZ_DIR}" \
+    --no_server \
+    --mode "${CAM_MODE}" >/dev/null
 fi
 
 echo "✅ Completed: ${BLOCK_NAME} (Mode: ${CAM_MODE})"
