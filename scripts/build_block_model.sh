@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# build_block_model.sh [V6]
-# - Update: 根據實測結果調整 360 模式的智慧 FOV 預設值 (4view->120, 8view->100)。
+# build_block_model.sh [V7-Fixed]
+# - Update: 移除 USE_STAGE 參數，強制使用 Staging 模式。
+# - Fix: 使用 db.txt 白名單與實體複製 (避開 Symlink)，徹底解決 COLMAP 資料庫路徑不匹配導致的 KeyError。
 
 set -euo pipefail
 
@@ -13,7 +14,7 @@ fi
 DATA_DIR="$(realpath "$1")"
 shift
 
-# 預設參數 (FOV 設為特殊值以判斷使用者是否輸入)
+# 預設參數
 CAM_MODE="std"
 DENSE_360=0
 FOV_360="AUTO" 
@@ -28,12 +29,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# [V6] 智慧 FOV 預設值邏輯
+# 智慧 FOV 預設值邏輯
 if [ "${CAM_MODE}" = "360" ] && [ "${FOV_360}" = "AUTO" ]; then
   if [ "${DENSE_360}" = "1" ]; then
-    FOV_360=100.0  # 8視角，100度已有足夠重疊
+    FOV_360=100.0  # 8視角
   else
-    FOV_360=120.0  # 4視角，需120度確保足夠重疊
+    FOV_360=120.0  # 4視角
   fi
 fi
 
@@ -65,7 +66,6 @@ GLOBAL_CONF="netvlad"
 LOCAL_CONF="superpoint_aachen"
 MATCHER_CONF="superpoint+lightglue"
 
-USE_STAGE="${USE_STAGE:-1}"
 REBUILD_SFM="${REBUILD_SFM:-0}"
 ALIGN_SFM="${ALIGN_SFM:-1}"
 NUM_RETRIEVAL="${NUM_RETRIEVAL:-10}"
@@ -80,6 +80,7 @@ PAIRS_DB_CLEAN="${OUT_DIR}/pairs-clean.txt"
 DB_MATCHES="${OUT_DIR}/db-matches-${MATCHER_CONF}.h5"
 SFM_DIR="${OUT_DIR}/sfm"
 SFM_MODELS_DIR="${SFM_DIR}/models"
+# [重要] 這是強制使用的隔離區路徑
 STAGE="${OUT_DIR}/_images_stage"
 SFM_ALIGNED="${OUT_DIR}/sfm_aligned"
 
@@ -94,6 +95,7 @@ if [ "${CAM_MODE}" = "360" ]; then
   echo "[0] (360 Mode) Converting Equirectangular to Pinhole..."
   SRC_360="${DATA_DIR}/db_360"
   DST_DB="${DATA_DIR}/db"
+  # 檢查來源
   if [ ! -d "${SRC_360}" ]; then echo "[Error] Missing ${SRC_360}"; exit 1; fi
   
   CONVERT_ARGS=( "--input_dir" "${SRC_360}" "--output_dir" "${DST_DB}" "--fov" "${FOV_360}" )
@@ -104,6 +106,7 @@ fi
 # -------- HLOC Pipeline --------
 echo "[1] Generating DB image list (db.txt)..."
 if [ ! -d "${DATA_DIR}/db" ]; then echo "[Error] ${DATA_DIR}/db not found."; exit 1; fi
+# 確保只列出 db 資料夾內的影像
 (cd "${DATA_DIR}" && find db -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.png' \) | sort) > "${DB_LIST}"
 if [ ! -s "${DB_LIST}" ]; then echo "[Error] No images in db/."; exit 1; fi
 echo "    > Found $(wc -l < "${DB_LIST}") DB images."
@@ -136,7 +139,6 @@ echo "[5] Building DB pairs..."
 if [ "${CAM_MODE}" = "360" ]; then
   echo "    > [360 Mode] Using explicit geometric pairing..."
   PAIRS_ARGS=( "--db_list" "${DB_LIST}" "--output" "${PAIRS_DB}" "--seq_window" "${SEQ_WINDOW}" )
-  # V4 Fix: 使用 awk -v 確保數值比較正確
   IS_FOV_GT_90=$(awk -v f="${FOV_360}" 'BEGIN {print (f > 90 ? 1 : 0)}')
   if [ "${IS_FOV_GT_90}" -eq 1 ]; then
       echo "      - FOV > 90 (${FOV_360}), enabling intra-frame matching."
@@ -172,7 +174,6 @@ PY
 PAIRS_USE="${PAIRS_DB_CLEAN}"
 
 echo "[7] Matching DB pairs (${MATCHER_CONF})..."
-# V4 Fix: 使用 Python API
 ${PY} - <<PY
 from pathlib import Path
 from hloc import match_features
@@ -189,20 +190,43 @@ if [ "${REBUILD_SFM}" = "1" ]; then rm -rf "${SFM_DIR}"; fi
 if [ -f "${SFM_DIR}/images.bin" ]; then
   echo "    > SfM exists. Skipping."
 else
-  if [ "${USE_STAGE}" = "1" ]; then
-      rm -rf "${STAGE}"; mkdir -p "${STAGE}/db"
-      ln -sf "$(realpath "${DATA_DIR}/db")"/* "${STAGE}/db/"
-      IMG_DIR="${STAGE}"
-  else
-      IMG_DIR="${DATA_DIR}"
-  fi
+  # ==============================================================================
+  # [CRITICAL FIX] 強制建立乾淨的 Staging 隔離區
+  # 原因 1: 避免 COLMAP 掃描到 raw/ 或 db_360/ 等無關檔案，導致資料庫污染。
+  # 原因 2: 避免使用 Symlink (ln -s)，因為 COLMAP 可能解析回絕對路徑 (../../../data/...)
+  #         導致與 hloc 特徵檔 (db/...) 的 Key 不匹配，引發 KeyError。
+  # 作法:   依據 db.txt 白名單，使用 Hard Link 或 Copy 將圖片放入 _images_stage。
+  # ==============================================================================
+  echo "    > [Fix] Staging images from db.txt to clean directory..."
+  rm -rf "${STAGE}"
+  mkdir -p "${STAGE}"
+  
+  count=0
+  while read -r rel_path; do
+      [ -z "$rel_path" ] && continue
+      
+      SRC_FILE="${DATA_DIR}/${rel_path}"
+      DST_FILE="${STAGE}/${rel_path}"
+      DST_DIR="$(dirname "${DST_FILE}")"
+      
+      if [ -f "${SRC_FILE}" ]; then
+          mkdir -p "${DST_DIR}"
+          # 優先嘗試 Hard Link (快速且無路徑解析問題)，失敗則退回 Copy
+          ln "${SRC_FILE}" "${DST_FILE}" 2>/dev/null || cp "${SRC_FILE}" "${DST_FILE}"
+          count=$((count+1))
+      fi
+  done < "${DB_LIST}"
+  
+  echo "      - Staged ${count} images to ${STAGE}"
+  IMG_DIR="${STAGE}"
+
+  # 執行 hloc 重建
   ${PY} -m hloc.reconstruction \
     --image_dir "${IMG_DIR}" --pairs "${PAIRS_USE}" \
     --features "${LOCAL_FEATS}" --matches "${DB_MATCHES}" \
     --sfm_dir "${SFM_DIR}" | tee "${LOG_DIR}/reconstruction.log"
 fi
 
-# V5 Fix: 完整的最大模型選擇邏輯
 echo "[9] Verifying SfM model..."
 NEED_SWAP=false; BEST_MODEL_PATH=""; MAX_IMG_COUNT=0; ROOT_IMG_COUNT=0
 if [ -f "${SFM_DIR}/images.bin" ]; then
@@ -237,7 +261,6 @@ else
   FINAL_SFM="${SFM_DIR}"
 fi
 if [ -f "${VIZ_SCRIPT}" ] && [ -d "${FINAL_SFM}" ]; then
-  # [Fix] 傳遞 CAM_MODE 給視覺化腳本
   "${PY}" "${VIZ_SCRIPT}" \
     --sfm_dir "${FINAL_SFM}" \
     --output_dir "${VIZ_DIR}" \
