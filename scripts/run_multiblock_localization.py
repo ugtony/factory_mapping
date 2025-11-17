@@ -7,12 +7,10 @@ from collections import defaultdict
 import logging
 import sys
 
-# ... (Import 部分保持不變) ...
+# ==========================================
+# 1. HLOC Import (相容性修復版)
+# ==========================================
 try:
-    from hloc.pipelines.Cambridge.utils import (
-        get_best_covisibility_clustering, get_best_hierarchical_clustering, 
-        evaluate_Aachen, get_covisibility_clusters, get_hierarchical_clusters
-    )
     from hloc.localize_sfm import main as localize_sfm
     from hloc.match_features import main as match_features, confs as match_confs
     from hloc.pairs_from_retrieval import main as pairs_from_retrieval
@@ -28,11 +26,18 @@ except ImportError:
         print(f"[Error] Critical HLOC import failed: {e}")
         sys.exit(1)
 
-# ... (load_global_descriptors 函式保持不變) ...
+# ==========================================
+# 2. 工具函式：強健的 H5 讀取器
+# ==========================================
 def load_global_descriptors(h5_path):
+    """
+    遞迴掃描 H5 檔案，找出所有包含 global descriptors 的圖片。
+    """
     names = []
     vectors = []
+    
     target_keys = ['global_descriptor', 'descriptors', 'global_descriptors']
+    
     def visit_fn(name, obj):
         if isinstance(obj, h5py.Group):
             for k in target_keys:
@@ -43,52 +48,71 @@ def load_global_descriptors(h5_path):
                     return
     with h5py.File(h5_path, 'r') as f:
         f.visititems(visit_fn)
-    if not names: return [], np.array([])
+        
+    if not names:
+        return [], np.array([])
+    
     vectors = np.array(vectors).squeeze()
     if vectors.ndim == 1: vectors = vectors[np.newaxis, :]
     return names, vectors
 
 # ==========================================
-# [New] 產生帶有內參的 Query List
+# 3. 產生帶有內參的 Query List
 # ==========================================
 def generate_query_list_with_intrinsics(output_path, image_names, width, height, fov_deg):
     """
     產生符合 COLMAP 格式的 query list，包含 SIMPLE_PINHOLE 內參。
-    格式: name SIMPLE_PINHOLE W H f cx cy
     """
     fov_rad = np.deg2rad(fov_deg)
     f = 0.5 * width / np.tan(0.5 * fov_rad)
     cx = width / 2.0
     cy = height / 2.0
-    
     model = "SIMPLE_PINHOLE"
     
     with open(output_path, 'w') as f_out:
         for name in image_names:
-            # 寫入格式: Name Model Width Height Params(f, cx, cy)
             line = f"{name} {model} {width} {height} {f:.4f} {cx} {cy}\n"
             f_out.write(line)
 
 # ==========================================
-# 主程式
+# 4. 主程式
 # ==========================================
 def main():
     parser = argparse.ArgumentParser(description="Multi-block localization pipeline")
     parser.add_argument("--query_dir", type=Path, required=True, help="Folder containing query images")
     parser.add_argument("--outputs_root", type=Path, required=True, help="Root of hloc outputs")
     parser.add_argument("--results_file", type=Path, default="submission.txt", help="Final poses output file")
-    parser.add_argument("--num_retrieval", type=int, default=10)
     
-    # [New Args] 相機參數 (必須與您轉檔時的設定一致)
+    parser.add_argument(
+        "--global_model", type=str, default="netvlad", 
+        choices=list(extract_confs.keys()), 
+        help="Global feature extractor model name."
+    )
+    
+    parser.add_argument("--num_retrieval", type=int, default=10)
     parser.add_argument("--width", type=int, default=1024, help="Query image width")
     parser.add_argument("--height", type=int, default=768, help="Query image height")
     parser.add_argument("--fov", type=float, default=100.0, help="Query image FOV (degrees)")
     
     args = parser.parse_args()
 
-    # 1. 掃描 Blocks
-    block_dirs = [d for d in args.outputs_root.iterdir() if d.is_dir() and (d / "global-netvlad.h5").exists()]
-    print(f"[Info] Found {len(block_dirs)} blocks: {[b.name for b in block_dirs]}")
+    # [FIX V2] 修正檔名不一致問題
+    try:
+        global_conf = extract_confs[args.global_model]
+    except KeyError:
+        print(f"[Error] Model '{args.global_model}' not found in hloc extract_confs.")
+        sys.exit(1)
+        
+    # 搜尋 DB (Block) 時，使用 build_block_model.sh 的自訂名稱
+    global_feature_filename_DB = f"global-{args.global_model}.h5" 
+    
+    print(f"[Info] Using global model: {args.global_model}")
+    print(f"[Info] DB Blocks must use filename: {global_feature_filename_DB}")
+
+
+    # 1. 掃描 Blocks (使用修正後的 DB 檔名)
+    block_dirs = [d for d in args.outputs_root.iterdir() if d.is_dir() and (d / global_feature_filename_DB).exists()]
+    print(f"[Info] Found {len(block_dirs)} blocks (using {global_feature_filename_DB}): {[b.name for b in block_dirs]}")
 
     if not block_dirs:
         print("[Error] No valid blocks found.")
@@ -101,7 +125,6 @@ def main():
     query_list_path = work_dir / "queries_with_intrinsics.txt"
     query_images = sorted([p.relative_to(args.query_dir).as_posix() for p in args.query_dir.glob("**/*") if p.suffix.lower() in {'.jpg','.png','.jpeg'}])
     
-    # [FIX] 產生帶有內參的列表 (localize_sfm 需要，extract_features 也相容)
     print(f"[Info] Generating query list with intrinsics (W={args.width}, H={args.height}, FOV={args.fov})...")
     generate_query_list_with_intrinsics(
         query_list_path, query_images, args.width, args.height, args.fov
@@ -109,12 +132,13 @@ def main():
     
     print(f"[Info] Extracting Query features for {len(query_images)} images...")
     
-    # Extract Global (NetVLAD)
+    # Extract Global (使用動態 config)
+    # 這裡會使用 hloc 標準名稱 (例如 'global-feats-netvlad.h5') 產生 Query 特徵
     global_feats_q = extract_features(
-        extract_confs['netvlad'], args.query_dir, export_dir=work_dir, image_list=query_list_path
+        global_conf, args.query_dir, export_dir=work_dir, image_list=query_list_path
     )
     
-    # Extract Local (SuperPoint)
+    # Extract Local (SuperPoint - 保持不變)
     local_feats_q = extract_features(
         extract_confs['superpoint_aachen'], args.query_dir, export_dir=work_dir, image_list=query_list_path
     )
@@ -128,7 +152,9 @@ def main():
     q_names, q_vectors = load_global_descriptors(global_feats_q)
     
     for block in block_dirs:
-        db_global_path = block / "global-netvlad.h5"
+        # 使用修正後的 DB 檔名
+        db_global_path = block / global_feature_filename_DB
+        
         db_names, db_vectors = load_global_descriptors(db_global_path)
         
         if len(db_names) == 0:
@@ -137,13 +163,9 @@ def main():
             
         print(f"  > Checking {block.name} ({len(db_names)} images)...")
 
-        # 計算相似度
         sim = np.dot(q_vectors, db_vectors.T)
         topk = min(5, len(db_names))
-        if topk > 0:
-            block_scores = np.sort(sim, axis=1)[:, -topk:].mean(axis=1)
-        else:
-            block_scores = np.zeros(len(q_names))
+        block_scores = np.sort(sim, axis=1)[:, -topk:].mean(axis=1) if topk > 0 else np.zeros(len(q_names))
 
         for i, score in enumerate(block_scores):
             q_name = q_names[i]
@@ -161,7 +183,6 @@ def main():
     for block, q_list in queries_by_block.items():
         print(f"--- Processing {len(q_list)} queries in {block.name} ---")
         
-        # [FIX] 針對每個 Block 產生對應的 Query List (同樣需要內參)
         block_q_list_path = work_dir / f"queries_{block.name}.txt"
         generate_query_list_with_intrinsics(
             block_q_list_path, q_list, args.width, args.height, args.fov
@@ -175,17 +196,21 @@ def main():
             print(f"[Warn] No local features found in {block.name}, skipping.")
             continue
         db_local = db_local_candidates[0]
-        db_global = block / "global-netvlad.h5"
+        
+        # 使用修正後的 DB 檔名
+        db_global = block / global_feature_filename_DB
         
         pairs_path = work_dir / f"pairs_{block.name}.txt"
         
         # (A) Retrieval
+        # global_feats_q 是 Query 特徵的路徑 (標準名)
+        # db_global 是 DB 特徵的路徑 (自訂名)
         pairs_from_retrieval(
             global_feats_q, pairs_path, num_matched=args.num_retrieval,
             query_list=block_q_list_path, db_list=None, db_descriptors=db_global
         )
         
-        # (B) Matching
+        # (B) Matching & Merge (使用 External Link 優化)
         matches_path = work_dir / f"matches_{block.name}.h5"
         merged_features_path = work_dir / f"features_{block.name}.h5"
         
@@ -211,7 +236,6 @@ def main():
         # (C) Localization
         block_results_path = work_dir / f"results_{block.name}.txt"
         try:
-            # 這裡傳入的 block_q_list_path 現在包含內參了，所以不會報錯
             localize_sfm(
                 sfm_dir, block_q_list_path, pairs_path,
                 merged_features_path, matches_path, block_results_path,
@@ -219,7 +243,6 @@ def main():
             )
         except Exception as e:
             print(f"[Error] Localization failed: {e}")
-            # Print full stacktrace for easier debugging if it fails again
             import traceback
             traceback.print_exc()
             continue
@@ -232,32 +255,20 @@ def main():
                     if len(parts) >= 8:
                         final_poses[parts[0]] = line.strip()
 
-    # ==========================================
-    # 5. 輸出結果 (修改版：加入 Block 名稱欄位)
-    # ==========================================
-    print(f"[Info] Writing results to {args.results_file}...")
-    
+    # 5. 輸出
     with open(args.results_file, 'w') as f:
-        # 修改 Header，增加 BlockName
         f.write("# ImageName, Qw, Qx, Qy, Qz, Tx, Ty, Tz, BlockName\n")
-        
-        success_count = 0
+        count = 0
         for q in query_images:
             if q in final_poses:
-                # 取得該 Query 被分配到的 Block 名稱
-                # query_best_block[q] 儲存的是 Path 物件，我們取 .name
                 block_path = query_best_block.get(q)
                 block_name = block_path.name if block_path else "Unknown"
-                
-                # 寫入原本的 Pose 字串，並在後面加上 Block 名稱
                 f.write(f"{final_poses[q]} {block_name}\n")
-                success_count += 1
+                count += 1
             else:
-                # 可選：失敗的也可以寫入，標記為 Failed (方便除錯)
-                # f.write(f"{q} # Failed\n") 
                 print(f"[Warn] Failed to localize: {q}")
 
-    print(f"✅ All done. Results: {args.results_file} ({success_count}/{len(query_images)} localized)")
+    print(f"✅ All done. Results: {args.results_file} ({count}/{len(query_images)} localized)")
 
 if __name__ == "__main__":
     main()
