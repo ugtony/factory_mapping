@@ -264,8 +264,7 @@ if [ -f "${VIZ_SCRIPT}" ] && [ -d "${FINAL_SFM}" ]; then
   "${PY}" "${VIZ_SCRIPT}" \
     --sfm_dir "${FINAL_SFM}" \
     --output_dir "${VIZ_DIR}" \
-    --no_server \
-    --mode "${CAM_MODE}" >/dev/null
+    --no_server >/dev/null
 fi
 
 echo "✅ Completed: ${BLOCK_NAME} (Mode: ${CAM_MODE})"
