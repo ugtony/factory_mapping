@@ -4,34 +4,71 @@
 # 針對一個「已經用 build_block_model.sh 建模完成」的 block，
 # 執行一組新的 query 影像的定位。
 #
-# - 會重用 DB 特徵與 SfM 模型
-# - **優先使用對齊後模型 sfm_aligned**，若不存在則回退 sfm
-# - 將 query 特徵寫回同一份 H5（沿用 build_block_model.sh 的設定）
+# [更新功能]
+# 1. 支援 --fov 與 --global-conf 參數。
+# 2. 自動根據 FOV 計算內參 (解決手機直/橫拍問題)。
+# 3. 保留完整的視覺化輸出 (Retrieval + Matches)。
 #
 set -euo pipefail
-set -x
+
+# --- 0. 參數解析 ---
+POSITIONAL_ARGS=()
+FOV_DEG="69.4"          # 預設 FOV (iPhone 1x)
+GLOBAL_CONF="netvlad"   # 預設 Global Model
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --fov=*)
+      FOV_DEG="${1#*=}"
+      shift
+      ;;
+    --fov)
+      FOV_DEG="$2"
+      shift 2
+      ;;
+    --global-conf=*|--global_conf=*)
+      GLOBAL_CONF="${1#*=}"
+      shift
+      ;;
+    --global-conf|--global_conf)
+      GLOBAL_CONF="$2"
+      shift 2
+      ;;
+    -*|--*)
+      echo "未知參數: $1"
+      exit 1
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# 恢復位置參數
+set -- "${POSITIONAL_ARGS[@]}"
 
 if [ $# -lt 2 ]; then
-  echo "用法: $0 <BLOCK_DATA_DIR> <BLOCK_OUTPUT_DIR>"
+  echo "用法: $0 <BLOCK_DATA_DIR> <BLOCK_OUTPUT_DIR> [--fov=FLOAT] [--global-conf=STR]"
   echo ""
   echo "參數說明:"
-  echo "  <BLOCK_DATA_DIR>:   包含 'db/' 和 'query/' 影像的資料夾 (例如: data/block_001)"
-  echo "  <BLOCK_OUTPUT_DIR>: 包含 'sfm/'、(可選) 'sfm_aligned/' 和特徵 H5 檔的資料夾 (例如: outputs-hloc/block_001)"
+  echo "  <BLOCK_DATA_DIR>:   包含 'db/' 和 'query/' 影像的資料夾"
+  echo "  <BLOCK_OUTPUT_DIR>: 包含 'sfm/' 和特徵 H5 檔的資料夾"
+  echo "  --fov:              Query 相機的長邊視野角 (預設: 69.4)"
+  echo "  --global-conf:      全域特徵模型名稱 (預設: netvlad)"
   echo ""
-  echo "範例: bash scripts/run_query_pipeline.sh data/block_001 outputs-hloc/block_001"
   exit 1
 fi
 
-# --- 0. Python 選擇（與 build_block_model.sh 一致） ---
+# --- 1. 環境與路徑設定 ---
 if [ -x "/opt/conda/bin/python" ]; then
   PY="/opt/conda/bin/python"
 else
   PY="${PY:-python3}"
 fi
 
-# --- 1. 路徑設定 ---
-BLOCK_DATA_DIR=$(realpath "$1") # e.g., data/block_001 (包含 db/ 和 query/)
-BLOCK_OUT_DIR=$(realpath "$2")  # e.g., outputs-hloc/block_001 (包含 sfm/ 與 *.h5)
+BLOCK_DATA_DIR=$(realpath "$1")
+BLOCK_OUT_DIR=$(realpath "$2")
 
 # 檢查輸入資料夾結構
 if [ ! -d "${BLOCK_DATA_DIR}/db" ]; then
@@ -43,31 +80,33 @@ if [ ! -d "${BLOCK_DATA_DIR}/query" ]; then
   exit 1
 fi
 
-# 查詢結果將儲存在 block 輸出目錄下的一個新資料夾，避免覆蓋
+# 查詢結果將儲存在 block 輸出目錄下的一個新資料夾
 QUERY_OUT_DIR="${BLOCK_OUT_DIR}/query_results_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${QUERY_OUT_DIR}"
 
-echo "--- 執行 HLOC 查詢 Pipeline ---"
+echo "--- 執行 HLOC 查詢 Pipeline (Auto-Intrinsics) ---"
 echo "影像根目錄 (Input): ${BLOCK_DATA_DIR}"
 echo "Block 輸出根目錄 (Input): ${BLOCK_OUT_DIR}"
 echo "查詢結果 (Output): ${QUERY_OUT_DIR}"
 echo "-------------------------------------"
+echo "設定 FOV: ${FOV_DEG}"
+echo "設定 Global Model: ${GLOBAL_CONF}"
+echo "-------------------------------------"
 
-# --- 2. 組態設定（必須與 build_block_model.sh 一致） ---
-GLOBAL_CONF="netvlad"
+# --- 2. 組態設定 ---
 LOCAL_CONF="superpoint_aachen"
 MATCHER_CONF="superpoint+lightglue"
 NUM_Q_PAIRS=10   # 每個 query 影像檢索 K 張最像的 DB 影像
 
 # --- 3. 檔案路徑定義 ---
-# 已存在（build_block_model.sh 產生）
 SFM_DIR_RAW="${BLOCK_OUT_DIR}/sfm"
 SFM_DIR_ALIGNED="${BLOCK_OUT_DIR}/sfm_aligned"
 DB_LIST="${BLOCK_OUT_DIR}/db.txt"
 LOCAL_FEATS_H5="${BLOCK_OUT_DIR}/local-${LOCAL_CONF}.h5"
+# 根據參數動態決定 Global 特徵檔名
 GLOBAL_FEATS_DB_H5="${BLOCK_OUT_DIR}/global-${GLOBAL_CONF}.h5"
 
-# 選擇實際要用來定位/視覺化的 SfM 目錄：**優先 sfm_aligned**
+# 優先使用對齊後 SfM 模型
 if [ -f "${SFM_DIR_ALIGNED}/images.bin" ]; then
   SFM_DIR="${SFM_DIR_ALIGNED}"
   echo "[Info] 使用對齊後 SfM 模型: ${SFM_DIR_ALIGNED}"
@@ -75,8 +114,7 @@ elif [ -f "${SFM_DIR_RAW}/images.bin" ]; then
   SFM_DIR="${SFM_DIR_RAW}"
   echo "[Info] 找不到 sfm_aligned，改用原始 SfM 模型: ${SFM_DIR_RAW}"
 else
-  echo "[Error] 找不到 SfM 模型（缺少 ${SFM_DIR_ALIGNED}/images.bin 與 ${SFM_DIR_RAW}/images.bin）。"
-  echo "請先執行 'scripts/build_block_model.sh' 完成建模與對齊。"
+  echo "[Error] 找不到 SfM 模型 (images.bin)。"
   exit 1
 fi
 
@@ -90,12 +128,14 @@ RESULTS_TXT="${QUERY_OUT_DIR}/poses.txt"
 VIZ_DIR="${QUERY_OUT_DIR}/visualization"
 mkdir -p "${VIZ_DIR}/retrieval" "${VIZ_DIR}/localization"
 
-# --- 4. 檢查 DB 所需檔案是否存在 ---
-if [ ! -f "${LOCAL_FEATS_H5}" ] || [ ! -f "${GLOBAL_FEATS_DB_H5}" ]; then
-  echo "[Error] 指定的 Block 輸出目錄缺少必要檔案:"
-  echo "  應有 Local Feats: ${LOCAL_FEATS_H5}"
-  echo "  應有 Global Feats: ${GLOBAL_FEATS_DB_H5}"
-  echo "請先執行 'scripts/build_block_model.sh' 來產生模型與特徵。"
+# --- 4. 檢查必要檔案 ---
+if [ ! -f "${LOCAL_FEATS_H5}" ]; then
+  echo "[Error] 缺少 Local 特徵檔案: ${LOCAL_FEATS_H5}"
+  exit 1
+fi
+if [ ! -f "${GLOBAL_FEATS_DB_H5}" ]; then
+  echo "[Error] 缺少 Global 特徵檔案: ${GLOBAL_FEATS_DB_H5}"
+  echo "       (請確認 build_block_model.sh 是否使用了 --global=${GLOBAL_CONF})"
   exit 1
 fi
 if [ ! -f "${DB_LIST}" ]; then
@@ -103,7 +143,7 @@ if [ ! -f "${DB_LIST}" ]; then
    exit 1
 fi
 
-# --- 5. 執行 Query Pipeline ---
+# --- 5. 執行 Pipeline ---
 echo "[1/8] 掃描 Query 影像 (from ${BLOCK_DATA_DIR}/query)..."
 ( cd "${BLOCK_DATA_DIR}" && find query -maxdepth 3 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | sort ) > "${Q_LIST_RAW}"
 if [ ! -s "${Q_LIST_RAW}" ]; then
@@ -112,14 +152,14 @@ if [ ! -s "${Q_LIST_RAW}" ]; then
 fi
 echo "    > 找到 $(wc -l < "${Q_LIST_RAW}") 張 Query 影像。"
 
-echo "[2/8] 擷取 Query 的局部特徵 (${LOCAL_CONF})..."
+echo "[2/8] 擷取 Query 局部特徵 (${LOCAL_CONF})..."
 ${PY} -m hloc.extract_features --conf ${LOCAL_CONF} \
   --image_dir "${BLOCK_DATA_DIR}" \
   --image_list "${Q_LIST_RAW}" \
   --export_dir "${QUERY_OUT_DIR}" \
   --feature_path "${LOCAL_FEATS_H5}"
 
-echo "[3/8] 擷取 Query 的全域特徵 (${GLOBAL_CONF})..."
+echo "[3/8] 擷取 Query 全域特徵 (${GLOBAL_CONF})..."
 ${PY} -m hloc.extract_features --conf ${GLOBAL_CONF} \
   --image_dir "${BLOCK_DATA_DIR}" \
   --image_list "${Q_LIST_RAW}" \
@@ -147,53 +187,55 @@ match_features.main(
 )
 PY
 
-echo "[6/8] 從 SfM 推斷 Query 影像的相機內參..."
-export SFM_DIR Q_LIST_RAW Q_LIST_INFERRED BLOCK_DATA_DIR
+echo "[6/8] 自動生成 Query 內參 (FOV=${FOV_DEG})..."
+export Q_LIST_RAW Q_LIST_INFERRED BLOCK_DATA_DIR FOV_DEG
 ${PY} - <<'PY'
 import os
+import cv2
+import numpy as np
 from pathlib import Path
-import pycolmap, cv2
-SFM_DIR   = Path(os.environ["SFM_DIR"])
+
 Q_RAW     = Path(os.environ["Q_LIST_RAW"])
 Q_TXT     = Path(os.environ["Q_LIST_INFERRED"])
 DATA_ROOT = Path(os.environ["BLOCK_DATA_DIR"])
-rec = pycolmap.Reconstruction(SFM_DIR)
-cams = list(rec.cameras.values())
-if not cams:
-    print(f"[Error] SfM 模型 {SFM_DIR} 中沒有找到相機。"); exit(1)
-def get_best_cam_model(qw, qh, all_cams):
-    def score(cam): return abs(cam.width - qw) + abs(cam.height - qh)
-    cam = min(all_cams, key=score)
-    try: model_name = cam.model.name
-    except Exception:
-        from pycolmap import CameraModel
-        model_name = CameraModel.name(cam.model_id)
-    params_str = " ".join(map(str, cam.params))
-    return cam, model_name, params_str
+FOV       = float(os.environ["FOV_DEG"])
+
 query_names = [l.strip() for l in Q_RAW.read_text().splitlines() if l.strip()]
-print(f"找到 {len(query_names)} 張 query 影像待處理...")
+print(f"處理 {len(query_names)} 張 query 影像待處理...")
+
 output_lines = []
+fov_rad = np.deg2rad(FOV)
+model_name = "SIMPLE_PINHOLE"
+
 for qname in query_names:
     qpath = DATA_ROOT / qname
     if not qpath.exists():
         print(f"[Warn] Query 影像不存在, 跳過: {qpath}")
         continue
+        
+    # 讀取圖片取得尺寸
     img = cv2.imread(str(qpath))
     if img is None:
         print(f"[Warn] 無法讀取 Query 影像, 跳過: {qpath}")
         continue
-    qh, qw = img.shape[:2]
-    cam, model_name, params_str = get_best_cam_model(qw, qh, cams)
-    line = f"{qname} {model_name} {cam.width} {cam.height} {params_str}"
+        
+    h, w = img.shape[:2]
+    
+    # 根據長邊 FOV 計算焦距 (解決直拍/橫拍問題)
+    max_side = max(w, h)
+    f = 0.5 * max_side / np.tan(fov_rad / 2.0)
+    cx = w / 2.0
+    cy = h / 2.0
+    
+    # COLMAP 格式: NAME MODEL W H PARAMS...
+    line = f"{qname} {model_name} {w} {h} {f:.4f} {cx} {cy}"
     output_lines.append(line)
-    if (cam.width, cam.height) != (qw, qh):
-        print(f"[info] Query '{qname}' ({qw}x{qh}) 使用 SfM cam ({cam.width}x{cam.height})")
+
 Q_TXT.write_text('\n'.join(output_lines) + '\n')
 print(f"✅ 已將 {len(output_lines)} 筆 query 內參寫入: {Q_TXT}")
 PY
 
 echo "[7/8] 執行定位 (localize_sfm)..."
-# 重要：必須 cd 到影像根目錄（因為 Q_LIST_RAW 路徑相對於它）
 ( cd "${BLOCK_DATA_DIR}" && ${PY} -m hloc.localize_sfm \
   --reference_sfm "${SFM_DIR}" \
   --queries "${Q_LIST_INFERRED}" \
@@ -204,7 +246,7 @@ echo "[7/8] 執行定位 (localize_sfm)..."
 
 echo "[8/8] 產生視覺化報告..."
 
-# 視覺化：檢索結果 (Retrieval)
+# 視覺化：檢索結果 (Retrieval) - 原始完整版
 export DATA_ROOT="${BLOCK_DATA_DIR}"
 export Q_LIST_RAW PAIRS_Q2DB VIZ_DIR
 export MAX_VIZ_IMAGES_RETRIEVAL=10
@@ -253,7 +295,7 @@ for q in queries:
 print(f"[Retrieval Viz] 寫入 {count} 張圖片到 {VIZ_DIR}")
 PY
 
-# 視覺化：本地化匹配 (Localization)
+# 視覺化：本地化匹配 (Localization) - 原始完整版
 export LOCAL_FEATS="${LOCAL_FEATS_H5}"
 export Q_MATCHES="${Q_MATCHES_H5}"
 export MAX_VIZ_IMAGES_LOCALIZATION=5
@@ -280,7 +322,6 @@ with open(PAIRS_Q2DB, "r") as f:
             q, db = p[0], p[1]
             if q not in q2db_top1: q2db_top1[q] = db
 
-# --- [修改 1] 抽樣前的總數 original_match_count ---
 def draw_matches(q, db, pts_q, pts_db, out_path, original_match_count):
     im_q = np.array(Image.open(DATA_ROOT / q).convert("RGB"))
     im_db = np.array(Image.open(DATA_ROOT / db).convert("RGB"))
@@ -291,7 +332,6 @@ def draw_matches(q, db, pts_q, pts_db, out_path, original_match_count):
     fig = plt.figure(figsize=(12,6)); ax = fig.add_subplot(1,1,1)
     ax.imshow(canvas); ax.axis('off'); shift_x = im_q.shape[1]
     
-    # 抽樣後的數量 (用於迴圈)
     num_matches_sampled = len(pts_q)
     
     if num_matches_sampled > 0:
@@ -316,7 +356,6 @@ def draw_matches(q, db, pts_q, pts_db, out_path, original_match_count):
             ax.scatter(x2 + shift_x, y2, 
                        s=circle_size, color=color, marker='o', alpha=line_alpha + 0.2)
 
-    # --- [修改 2] 使用 original_match_count 來設定標題 ---
     ax.set_title(f"{q} ↔ {db} (matches={original_match_count})")
     fig.savefig(out_path, bbox_inches='tight', dpi=160); plt.close(fig)
 
@@ -357,20 +396,16 @@ with h5py.File(str(LOCAL_FEATS), 'r') as ffeat, h5py.File(str(Q_MATCHES), 'r') a
             pts_q = kpts_q[idx_q][:, :2]
             pts_db = kpts_db[idx_db][:, :2]
         
-        # [改善] 隨機抽樣匹配點對，避免線條過密
         MAX_LINES_TO_DRAW = 200
-        
-        # --- [修改 3] 儲存抽樣前的總數 ---
         num_matches_original = len(pts_q)
         
         if num_matches_original > MAX_LINES_TO_DRAW:
             indices = random.sample(range(num_matches_original), MAX_LINES_TO_DRAW)
-            pts_q = pts_q[indices] # pts_q 變成抽樣後的
+            pts_q = pts_q[indices] 
             pts_db = pts_db[indices]
             
         out = VIZ_DIR / (Path(q).stem.replace('/', '_') + "_matches.jpg")
         try: 
-            # --- [修改 4] 將抽樣前的總數傳入 ---
             draw_matches(q, db, pts_q, pts_db, out, num_matches_original)
             done += 1
         except Exception as e: 
@@ -380,7 +415,7 @@ with h5py.File(str(LOCAL_FEATS), 'r') as ffeat, h5py.File(str(Q_MATCHES), 'r') a
 print(f"[Localization Viz] 寫入 {done} 張圖片到 {VIZ_DIR}")
 PY
 
-# 視覺化：HTML 匯出（改用選擇後的 SFM_DIR：可能是 sfm_aligned 或 sfm）
+# 視覺化：HTML 匯出
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIZ_PY_SCRIPT="${SCRIPT_DIR}/visualize_sfm_open3d.py"
 if [ -f "${VIZ_PY_SCRIPT}" ]; then

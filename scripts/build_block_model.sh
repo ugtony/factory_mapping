@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# build_block_model.sh [V7-Fixed]
+# build_block_model.sh [V8-Configurable Global Model]
+# - Update: 支援 --global-conf 參數 (netvlad / megaloc)。
 # - Update: 移除 USE_STAGE 參數，強制使用 Staging 模式。
 # - Fix: 使用 db.txt 白名單與實體複製 (避開 Symlink)，徹底解決 COLMAP 資料庫路徑不匹配導致的 KeyError。
 
@@ -7,7 +8,11 @@ set -euo pipefail
 
 # -------- 0. 參數解析 --------
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=FLOAT] [...]"
+  echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=FLOAT] [--global-conf=STR]"
+  echo "  --mode:        std (default) or 360"
+  echo "  --dense:       (360 mode) Use 8 views instead of 4"
+  echo "  --fov:         (360 mode) Override FOV (Auto-calculated if unset)"
+  echo "  --global-conf: Global feature model (default: netvlad)"
   exit 1
 fi
 
@@ -18,13 +23,28 @@ shift
 CAM_MODE="std"
 DENSE_360=0
 FOV_360="AUTO" 
+GLOBAL_CONF="netvlad"  # 預設全域特徵模型
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --mode=*) CAM_MODE="${1#*=}" ;;
-    --dense)  DENSE_360=1 ;;
-    --fov=*)  FOV_360="${1#*=}" ;;
-    *) ;;
+    --mode=*) 
+      CAM_MODE="${1#*=}" 
+      ;;
+    --dense)  
+      DENSE_360=1 
+      ;;
+    --fov=*)  
+      FOV_360="${1#*=}" 
+      ;;
+    --global-conf=*|--global_conf=*) 
+      GLOBAL_CONF="${1#*=}" 
+      ;;
+    --global-conf|--global_conf) 
+      GLOBAL_CONF="$2"
+      shift 
+      ;;
+    *) 
+      ;;
   esac
   shift
 done
@@ -53,7 +73,9 @@ mkdir -p "${OUT_DIR}" "${LOG_DIR}" "${VIZ_DIR}" "${DBG_DIR}"
 if [ -x "/opt/conda/bin/python" ]; then PY="/opt/conda/bin/python"; else PY="${PY:-python3}"; fi
 
 echo "========================================"
-echo "[Info] Block: ${BLOCK_NAME} | Mode: ${CAM_MODE^^}"
+echo "[Info] Block: ${BLOCK_NAME}"
+echo "[Info] Mode: ${CAM_MODE^^}"
+echo "[Info] Global Model: ${GLOBAL_CONF}"
 if [ "${CAM_MODE}" = "360" ]; then
   [ "${DENSE_360}" = "1" ] && V_TYPE="Dense(8)" || V_TYPE="Sparse(4)"
   echo "[Info] 360 Settings: ${V_TYPE}, FOV=${FOV_360}"
@@ -62,7 +84,7 @@ echo "[Info] Output: ${OUT_DIR}"
 echo "========================================"
 
 # -------- 2. 組態設定 --------
-GLOBAL_CONF="netvlad"
+# GLOBAL_CONF 已在上方解析
 LOCAL_CONF="superpoint_aachen"
 MATCHER_CONF="superpoint+lightglue"
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from collections import defaultdict
 import logging
 import sys
+from PIL import Image  # [NEW] 需要用來讀取圖片尺寸
 
 # ==========================================
 # 1. HLOC Import (相容性修復版)
@@ -57,28 +58,52 @@ def load_global_descriptors(h5_path):
     return names, vectors
 
 # ==========================================
-# 3. 產生帶有內參的 Query List
+# 3. 產生帶有內參的 Query List (自動判斷版)
 # ==========================================
-def generate_query_list_with_intrinsics(output_path, image_names, width, height, fov_deg):
+def generate_query_list_with_intrinsics(output_path, image_names, query_root_dir, fov_deg):
     """
-    產生符合 COLMAP 格式的 query list，包含 SIMPLE_PINHOLE 內參。
+    [修改版] 自動讀取影像尺寸，並依據長邊 FOV 計算焦距。
+    解決直拍/橫拍混用問題，無需手動輸入 width/height。
     """
     fov_rad = np.deg2rad(fov_deg)
-    f = 0.5 * width / np.tan(0.5 * fov_rad)
-    cx = width / 2.0
-    cy = height / 2.0
     model = "SIMPLE_PINHOLE"
     
+    print(f"[Auto] Generating intrinsics list based on Long-Side FOV = {fov_deg}°...")
+
     with open(output_path, 'w') as f_out:
         for name in image_names:
-            line = f"{name} {model} {width} {height} {f:.4f} {cx} {cy}\n"
+            img_path = query_root_dir / name
+            if not img_path.exists():
+                print(f"[Warn] Image not found: {img_path}, skipping.")
+                continue
+
+            # 1. 實際讀取圖片取得尺寸
+            try:
+                with Image.open(img_path) as img:
+                    w_real, h_real = img.size
+            except Exception as e:
+                print(f"[Error] Cannot read image size: {name}, skipping. ({e})")
+                continue
+
+            # 2. 判斷長邊，計算焦距
+            # 邏輯：Focal Length = (Long_Side / 2) / tan(FOV / 2)
+            # 這樣無論直拍橫拍，焦距都會是正確的
+            max_side = max(w_real, h_real)
+            f = 0.5 * max_side / np.tan(0.5 * fov_rad)
+            
+            # 3. 主點設為中心
+            cx = w_real / 2.0
+            cy = h_real / 2.0
+            
+            # 寫入 COLMAP 格式
+            line = f"{name} {model} {w_real} {h_real} {f:.4f} {cx} {cy}\n"
             f_out.write(line)
 
 # ==========================================
 # 4. 主程式
 # ==========================================
 def main():
-    parser = argparse.ArgumentParser(description="Multi-block localization pipeline")
+    parser = argparse.ArgumentParser(description="Multi-block localization pipeline (Auto-Intrinsics)")
     parser.add_argument("--query_dir", type=Path, required=True, help="Folder containing query images")
     parser.add_argument("--outputs_root", type=Path, required=True, help="Root of hloc outputs")
     parser.add_argument("--results_file", type=Path, default="submission.txt", help="Final poses output file")
@@ -90,29 +115,32 @@ def main():
     )
     
     parser.add_argument("--num_retrieval", type=int, default=10)
-    parser.add_argument("--width", type=int, default=1024, help="Query image width")
-    parser.add_argument("--height", type=int, default=768, help="Query image height")
-    parser.add_argument("--fov", type=float, default=100.0, help="Query image FOV (degrees)")
+    # [修改] 移除 width/height，只保留 FOV
+    parser.add_argument("--fov", type=float, default=69.4, help="Query camera Max-Side FOV (e.g. iPhone 1x = 69.4)")
     
     args = parser.parse_args()
 
-    # [FIX V2] 修正檔名不一致問題
+    # 檢查 Image 模組
+    try:
+        from PIL import Image
+    except ImportError:
+        print("[Error] PIL (Pillow) is required. Please install it: pip install Pillow")
+        sys.exit(1)
+
     try:
         global_conf = extract_confs[args.global_model]
     except KeyError:
         print(f"[Error] Model '{args.global_model}' not found in hloc extract_confs.")
         sys.exit(1)
         
-    # 搜尋 DB (Block) 時，使用 build_block_model.sh 的自訂名稱
     global_feature_filename_DB = f"global-{args.global_model}.h5" 
     
     print(f"[Info] Using global model: {args.global_model}")
     print(f"[Info] DB Blocks must use filename: {global_feature_filename_DB}")
 
-
-    # 1. 掃描 Blocks (使用修正後的 DB 檔名)
+    # 1. 掃描 Blocks
     block_dirs = [d for d in args.outputs_root.iterdir() if d.is_dir() and (d / global_feature_filename_DB).exists()]
-    print(f"[Info] Found {len(block_dirs)} blocks (using {global_feature_filename_DB}): {[b.name for b in block_dirs]}")
+    print(f"[Info] Found {len(block_dirs)} blocks: {[b.name for b in block_dirs]}")
 
     if not block_dirs:
         print("[Error] No valid blocks found.")
@@ -125,20 +153,22 @@ def main():
     query_list_path = work_dir / "queries_with_intrinsics.txt"
     query_images = sorted([p.relative_to(args.query_dir).as_posix() for p in args.query_dir.glob("**/*") if p.suffix.lower() in {'.jpg','.png','.jpeg'}])
     
-    print(f"[Info] Generating query list with intrinsics (W={args.width}, H={args.height}, FOV={args.fov})...")
+    print(f"[Info] Found {len(query_images)} query images.")
+    print(f"[Info] Generating intrinsics (Auto-detect size, FOV={args.fov})...")
+    
+    # [修改] 呼叫自動內參生成函式
     generate_query_list_with_intrinsics(
-        query_list_path, query_images, args.width, args.height, args.fov
+        query_list_path, query_images, args.query_dir, args.fov
     )
     
-    print(f"[Info] Extracting Query features for {len(query_images)} images...")
+    print(f"[Info] Extracting Query features...")
     
-    # Extract Global (使用動態 config)
-    # 這裡會使用 hloc 標準名稱 (例如 'global-feats-netvlad.h5') 產生 Query 特徵
+    # Extract Global
     global_feats_q = extract_features(
         global_conf, args.query_dir, export_dir=work_dir, image_list=query_list_path
     )
     
-    # Extract Local (SuperPoint - 保持不變)
+    # Extract Local (SuperPoint)
     local_feats_q = extract_features(
         extract_confs['superpoint_aachen'], args.query_dir, export_dir=work_dir, image_list=query_list_path
     )
@@ -151,17 +181,19 @@ def main():
     
     q_names, q_vectors = load_global_descriptors(global_feats_q)
     
+    if len(q_names) == 0:
+         print("[Error] Failed to extract global descriptors for queries.")
+         return
+
     for block in block_dirs:
-        # 使用修正後的 DB 檔名
         db_global_path = block / global_feature_filename_DB
-        
         db_names, db_vectors = load_global_descriptors(db_global_path)
         
         if len(db_names) == 0:
             print(f"[Warn] Block {block.name} is empty or invalid format.")
             continue
             
-        print(f"  > Checking {block.name} ({len(db_names)} images)...")
+        # print(f"  > Checking {block.name} ({len(db_names)} images)...")
 
         sim = np.dot(q_vectors, db_vectors.T)
         topk = min(5, len(db_names))
@@ -184,8 +216,10 @@ def main():
         print(f"--- Processing {len(q_list)} queries in {block.name} ---")
         
         block_q_list_path = work_dir / f"queries_{block.name}.txt"
+        
+        # [修改] 針對此 Block 的影像再次生成內參列表 (因為 localize_sfm 需要獨立的 query list)
         generate_query_list_with_intrinsics(
-            block_q_list_path, q_list, args.width, args.height, args.fov
+            block_q_list_path, q_list, args.query_dir, args.fov
         )
             
         sfm_dir = block / "sfm_aligned"
@@ -196,21 +230,17 @@ def main():
             print(f"[Warn] No local features found in {block.name}, skipping.")
             continue
         db_local = db_local_candidates[0]
-        
-        # 使用修正後的 DB 檔名
         db_global = block / global_feature_filename_DB
         
         pairs_path = work_dir / f"pairs_{block.name}.txt"
         
         # (A) Retrieval
-        # global_feats_q 是 Query 特徵的路徑 (標準名)
-        # db_global 是 DB 特徵的路徑 (自訂名)
         pairs_from_retrieval(
             global_feats_q, pairs_path, num_matched=args.num_retrieval,
             query_list=block_q_list_path, db_list=None, db_descriptors=db_global
         )
         
-        # (B) Matching & Merge (使用 External Link 優化)
+        # (B) Matching & Merge
         matches_path = work_dir / f"matches_{block.name}.h5"
         merged_features_path = work_dir / f"features_{block.name}.h5"
         
@@ -243,8 +273,6 @@ def main():
             )
         except Exception as e:
             print(f"[Error] Localization failed: {e}")
-            import traceback
-            traceback.print_exc()
             continue
 
         if block_results_path.exists():
@@ -266,7 +294,8 @@ def main():
                 f.write(f"{final_poses[q]} {block_name}\n")
                 count += 1
             else:
-                print(f"[Warn] Failed to localize: {q}")
+                # print(f"[Warn] Failed to localize: {q}")
+                pass
 
     print(f"✅ All done. Results: {args.results_file} ({count}/{len(query_images)} localized)")
 
