@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-run_localization.py [V9 - Log Fix]
-統一的室內定位腳本。
+run_localization.py [Refactored V10]
+統一的室內定位腳本 (使用 hloc_io_utils 模組)。
 
-修正歷程：
-1. [Fix] 修正 Log 讀取邏輯：支援 HLOC 的 nested log 結構 (logs['loc'][q_name])，解決 Inliers 讀不到導致為 0 的問題。
-2. [Fix] 針對 matches.h5 路徑編碼問題增加相容性檢查。
-3. [Fix] 視覺化 Key 搜尋邏輯優化。
-4. [Fix] 增加舊資料清理機制。
+主要更新：
+1. [Refactor] 引入 scripts/hloc_io_utils.py，將檔案讀取邏輯模組化，避免重複錯誤。
+2. [Robust] 使用 load_global_descriptors_safe 解決維度問題。
+3. [Robust] 使用 get_matches_key 解決路徑編碼問題。
+4. [Robust] 使用 parse_localization_log 解決 Log 結構問題。
 """
 
 import argparse
 import sys
 import os
-import pickle
 import numpy as np
 import h5py
 import shutil
@@ -21,9 +20,16 @@ from pathlib import Path
 from collections import defaultdict
 import cv2
 
-# 嘗試載入同目錄下的 visualize_sfm_open3d
+# 設定 path 以便 import 同目錄下的模組
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.append(str(SCRIPT_DIR))
+
+# 引入我們剛建立的工具模組
+try:
+    from hloc_io_utils import load_global_descriptors_safe, get_matches_key, parse_localization_log
+except ImportError:
+    print("[Error] Could not import hloc_io_utils. Please create scripts/hloc_io_utils.py first.")
+    sys.exit(1)
 
 try:
     import visualize_sfm_open3d
@@ -31,9 +37,7 @@ try:
 except ImportError:
     HAS_VIZ_3D = False
 
-# ==========================================
-# 1. HLOC Imports
-# ==========================================
+# HLOC Imports
 try:
     from hloc.localize_sfm import main as localize_sfm
     from hloc.extract_features import main as extract_features, confs as extract_confs
@@ -43,9 +47,7 @@ except ImportError:
     print("[Error] HLOC not found or import failed.")
     sys.exit(1)
 
-# ==========================================
-# 2. 工具函式
-# ==========================================
+# --- Config Loading ---
 def load_shell_config(config_path):
     cfg = {}
     if not config_path.exists(): return cfg
@@ -79,26 +81,7 @@ def generate_intrinsics(query_list, image_dir, output_path, fov_deg):
     with open(output_path, 'w') as f:
         f.write('\n'.join(lines) + '\n')
 
-def load_global_descriptors(h5_path):
-    names, vectors = [], []
-    def visit(name, obj):
-        if isinstance(obj, h5py.Group) and 'global_descriptor' in obj:
-            names.append(name)
-            vectors.append(obj['global_descriptor'].__array__())
-    with h5py.File(h5_path, 'r') as f:
-        f.visititems(visit)
-    
-    if len(vectors) == 0: return [], np.array([])
-    
-    vecs = np.array(vectors)
-    if vecs.ndim == 3 and vecs.shape[1] == 1: vecs = vecs.squeeze(1)
-    if vecs.ndim == 1: vecs = vecs[np.newaxis, :] 
-    
-    return names, vecs
-
-# ==========================================
-# 3. 視覺化函式
-# ==========================================
+# --- Visualization Functions (Using hloc_io_utils) ---
 def run_viz_retrieval(query_list, pairs_path, query_root, db_root, out_dir, max_figs=10):
     try: from PIL import Image
     except ImportError: return
@@ -159,21 +142,9 @@ def run_viz_matches(query_list, pairs_path, local_feats, matches_h5, query_root,
         for q in query_list:
             if q not in top1_pairs: continue
             db = top1_pairs[q]
-            pair_key = None
             
-            def find_key_robust(name, obj):
-                nonlocal pair_key
-                if pair_key: return
-                if isinstance(obj, h5py.Dataset) and name.endswith("matches0"):
-                    clean_path = name.replace("/matches0", "")
-                    padded_name = f"/{clean_path}/"
-                    padded_q = f"/{q}/"
-                    padded_db = f"/{db}/"
-                    if (padded_q in padded_name and padded_db in padded_name) or \
-                       (q.replace('/','-') in name and db.replace('/','-') in name):
-                        pair_key = name
-                        
-            fmat.visititems(find_key_robust)
+            # [Refactor] 使用 helper function 找 key
+            pair_key = get_matches_key(fmat, q, db)
             
             if not pair_key: continue
             matches = fmat[pair_key].__array__()
@@ -203,9 +174,7 @@ def run_viz_matches(query_list, pairs_path, local_feats, matches_h5, query_root,
             if count >= max_figs: break
     print(f"[Viz] Generated {count} match visualizations.")
 
-# ==========================================
-# 4. 主程式
-# ==========================================
+# --- Main ---
 def main():
     project_root = SCRIPT_DIR.parent
     config = load_shell_config(project_root / "project_config.env")
@@ -213,7 +182,7 @@ def main():
     default_fov = float(config.get("FOV", 69.4))
     default_global = config.get("GLOBAL_CONF", "netvlad")
 
-    parser = argparse.ArgumentParser(description="Unified HLOC Localization Pipeline (Robust Top-K)")
+    parser = argparse.ArgumentParser(description="Unified HLOC Localization Pipeline (Refactored)")
     parser.add_argument("--query_dir", type=Path, required=True, help="Directory containing query images")
     parser.add_argument("--reference", "--ref", dest="reference", type=Path, required=True,
                         help="Path to a SINGLE block OR a ROOT directory (Multi Block)")
@@ -257,19 +226,17 @@ def main():
         for q in query_images: block_tasks[ref_path].append(q)
     else:
         print("[Step 2] Scoring blocks (Global Retrieval)...")
-        q_names, q_vecs = load_global_descriptors(feats_global_q)
+        # [Refactor] 使用 helper function 讀取 features
+        q_names, q_vecs = load_global_descriptors_safe(feats_global_q)
         
-        candidate_blocks = []
-        for d in ref_path.iterdir():
-            if d.is_dir() and (d / f"global-{args.global_conf}.h5").exists():
-                candidate_blocks.append(d)
-        
+        candidate_blocks = [d for d in ref_path.iterdir() if d.is_dir() and (d / f"global-{args.global_conf}.h5").exists()]
         print(f"    > Comparing {len(query_images)} queries against {len(candidate_blocks)} blocks...")
         
         for block_dir in candidate_blocks:
             db_g = block_dir / f"global-{args.global_conf}.h5"
             try:
-                db_names, db_vecs = load_global_descriptors(db_g)
+                # [Refactor] 使用 helper function
+                db_names, db_vecs = load_global_descriptors_safe(db_g)
                 if len(db_vecs) == 0: continue
                 sim = np.dot(q_vecs, db_vecs.T)
                 topk_db = min(5, sim.shape[1])
@@ -329,7 +296,6 @@ def main():
         
         merged_feats = work_dir / f"feats_merged_{block_name}.h5"
         if merged_feats.exists(): merged_feats.unlink()
-        
         if matches_path.exists(): matches_path.unlink()
         
         with h5py.File(merged_feats, 'w') as f_out:
@@ -356,28 +322,19 @@ def main():
         except Exception as e:
             print(f"[Error] Localization failed: {e}"); continue
 
+        # [Refactor] 使用 helper function 讀取 Log
         log_path = Path(str(results_path) + "_logs.pkl")
-        logs = {}
-        if log_path.exists():
-            with open(log_path, 'rb') as f: logs = pickle.load(f)
+        inliers_map = parse_localization_log(log_path)
         
-        # [Fix V9] Handle nested log structure: logs['loc'][q_name]
-        # This fixes the "0 inliers" bug because we were looking in the wrong place
-        loc_logs = logs.get('loc', logs)
-
         if results_path.exists():
             with open(results_path, 'r') as f:
                 for line in f:
                     if line.startswith('#'): continue
                     p = line.strip().split()
                     q_name = p[0]
-                    n_inliers = 0
                     
-                    # Use loc_logs to access the correct dictionary
-                    if q_name in loc_logs:
-                        entry = loc_logs[q_name]
-                        if 'PnP_ret' in entry:
-                            n_inliers = entry['PnP_ret'].get('num_inliers', 0)
+                    # 從 map 取得 inliers
+                    n_inliers = inliers_map.get(q_name, 0)
                     
                     results_pool[q_name].append({
                         'block': block_name,
