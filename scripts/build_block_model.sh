@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # build_block_model.sh [V8-Configurable Global Model]
-# - Update: 支援 --global-conf 參數 (netvlad / megaloc)。
+# - Update: 支援從 project_config.env 讀取預設參數。
+# - Update: 統一參數名稱為 --global-conf。
 # - Update: 移除 USE_STAGE 參數，強制使用 Staging 模式。
 # - Fix: 使用 db.txt 白名單與實體複製 (避開 Symlink)，徹底解決 COLMAP 資料庫路徑不匹配導致的 KeyError。
 
 set -euo pipefail
 
-# -------- 0. 參數解析 --------
+# -------- 0. 參數解析與設定檔讀取 --------
 if [ $# -lt 1 ]; then
   echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=FLOAT] [--global-conf=STR]"
   echo "  --mode:        std (default) or 360"
@@ -19,12 +20,30 @@ fi
 DATA_DIR="$(realpath "$1")"
 shift
 
-# 預設參數
-CAM_MODE="std"
-DENSE_360=0
-FOV_360="AUTO" 
-GLOBAL_CONF="netvlad"  # 預設全域特徵模型
+# --- 讀取設定檔 ---
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/..")"
+CONFIG_FILE="${PROJECT_ROOT}/project_config.env"
 
+# 1. 硬編碼預設值
+DEFAULT_MODE="std"
+DEFAULT_DENSE=0
+DEFAULT_FOV="AUTO"
+DEFAULT_GLOBAL="netvlad"
+
+# 2. 嘗試載入設定檔
+if [ -f "${CONFIG_FILE}" ]; then
+  echo "[Init] Loading config from ${CONFIG_FILE}..."
+  source "${CONFIG_FILE}"
+fi
+
+# 3. 套用設定檔值 (若無則使用預設值)
+CAM_MODE="${MODE:-$DEFAULT_MODE}"
+if [[ "${DENSE:-$DEFAULT_DENSE}" =~ ^(1|true|True)$ ]]; then DENSE_360=1; else DENSE_360=0; fi
+FOV_360="${FOV:-$DEFAULT_FOV}"
+GLOBAL_CONF="${GLOBAL_CONF:-$DEFAULT_GLOBAL}"
+
+# 4. 解析 CLI 參數 (覆寫上述設定)
 while [ $# -gt 0 ]; do
   case "$1" in
     --mode=*) 
@@ -36,10 +55,11 @@ while [ $# -gt 0 ]; do
     --fov=*)  
       FOV_360="${1#*=}" 
       ;;
-    --global-conf=*|--global_conf=*) 
+    # 統一參數介面，相容多種寫法
+    --global-conf=*|--global_conf=*|--global_model=*) 
       GLOBAL_CONF="${1#*=}" 
       ;;
-    --global-conf|--global_conf) 
+    --global-conf|--global_conf|--global_model) 
       GLOBAL_CONF="$2"
       shift 
       ;;
@@ -60,8 +80,6 @@ fi
 
 # -------- 1. 路徑與環境設定 --------
 BLOCK_NAME="$(basename "${DATA_DIR}")"
-SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/..")"
 OUT_ROOT="${PROJECT_ROOT}/outputs-hloc"
 OUT_DIR="${OUT_ROOT}/${BLOCK_NAME}"
 LOG_DIR="${OUT_DIR}/logs"
@@ -214,10 +232,7 @@ if [ -f "${SFM_DIR}/images.bin" ]; then
 else
   # ==============================================================================
   # [CRITICAL FIX] 強制建立乾淨的 Staging 隔離區
-  # 原因 1: 避免 COLMAP 掃描到 raw/ 或 db_360/ 等無關檔案，導致資料庫污染。
-  # 原因 2: 避免使用 Symlink (ln -s)，因為 COLMAP 可能解析回絕對路徑 (../../../data/...)
-  #         導致與 hloc 特徵檔 (db/...) 的 Key 不匹配，引發 KeyError。
-  # 作法:   依據 db.txt 白名單，使用 Hard Link 或 Copy 將圖片放入 _images_stage。
+  # 作法: 依據 db.txt 白名單，使用 Hard Link 或 Copy 將圖片放入 _images_stage。
   # ==============================================================================
   echo "    > [Fix] Staging images from db.txt to clean directory..."
   rm -rf "${STAGE}"
@@ -233,7 +248,6 @@ else
       
       if [ -f "${SRC_FILE}" ]; then
           mkdir -p "${DST_DIR}"
-          # 優先嘗試 Hard Link (快速且無路徑解析問題)，失敗則退回 Copy
           ln "${SRC_FILE}" "${DST_FILE}" 2>/dev/null || cp "${SRC_FILE}" "${DST_FILE}"
           count=$((count+1))
       fi

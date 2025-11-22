@@ -6,7 +6,7 @@ from pathlib import Path
 from collections import defaultdict
 import logging
 import sys
-from PIL import Image  # [NEW] 需要用來讀取圖片尺寸
+import os  # [Update] Added for path resolution
 
 # ==========================================
 # 1. HLOC Import (相容性修復版)
@@ -28,8 +28,31 @@ except ImportError:
         sys.exit(1)
 
 # ==========================================
-# 2. 工具函式：強健的 H5 讀取器
+# 2. 工具函式
 # ==========================================
+def load_shell_config(config_path):
+    """[Update] 簡單解析 .env 格式檔案，回傳字典"""
+    cfg = {}
+    if not config_path.exists():
+        return cfg
+    
+    print(f"[Init] Loading config from {config_path}")
+    try:
+        with open(config_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                # 忽略註解與空行
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    # 去除引號
+                    value = value.strip().strip('"').strip("'")
+                    cfg[key.strip()] = value
+    except Exception as e:
+        print(f"[Warn] Failed to load config: {e}")
+    return cfg
+
 def load_global_descriptors(h5_path):
     """
     遞迴掃描 H5 檔案，找出所有包含 global descriptors 的圖片。
@@ -58,7 +81,7 @@ def load_global_descriptors(h5_path):
     return names, vectors
 
 # ==========================================
-# 3. 產生帶有內參的 Query List (自動判斷版)
+# 3. 產生帶有內參的 Query List
 # ==========================================
 def generate_query_list_with_intrinsics(output_path, image_names, query_root_dir, fov_deg):
     """
@@ -100,25 +123,45 @@ def generate_query_list_with_intrinsics(output_path, image_names, query_root_dir
             f_out.write(line)
 
 # ==========================================
-# 4. 主程式
+# 4. 主程式 (Updated)
 # ==========================================
 def main():
+    # 1. 讀取設定檔
+    script_dir = Path(__file__).parent.resolve()
+    project_root = script_dir.parent
+    config_path = project_root / "project_config.env"
+    
+    file_config = load_shell_config(config_path)
+    
+    # 從設定檔取得預設值
+    default_global = file_config.get("GLOBAL_CONF", "netvlad")
+    default_fov = float(file_config.get("FOV", 69.4))
+
     parser = argparse.ArgumentParser(description="Multi-block localization pipeline (Auto-Intrinsics)")
     parser.add_argument("--query_dir", type=Path, required=True, help="Folder containing query images")
     parser.add_argument("--outputs_root", type=Path, required=True, help="Root of hloc outputs")
     parser.add_argument("--results_file", type=Path, default="submission.txt", help="Final poses output file")
     
+    # [Update] 統一使用 global-conf，並載入預設值
     parser.add_argument(
-        "--global_model", type=str, default="netvlad", 
-        choices=list(extract_confs.keys()), 
-        help="Global feature extractor model name."
+        "--global-conf", "--global_model", dest="global_conf", 
+        type=str, 
+        default=default_global, 
+        help=f"Global feature extractor model name (default: {default_global})"
     )
     
     parser.add_argument("--num_retrieval", type=int, default=10)
-    # [修改] 移除 width/height，只保留 FOV
-    parser.add_argument("--fov", type=float, default=69.4, help="Query camera Max-Side FOV (e.g. iPhone 1x = 69.4)")
+    parser.add_argument(
+        "--fov", 
+        type=float, 
+        default=default_fov, 
+        help=f"Query camera Max-Side FOV (default: {default_fov})"
+    )
     
     args = parser.parse_args()
+    
+    # 相容性別名: 程式碼中部分邏輯仍可能使用 args.global_model
+    args.global_model = args.global_conf
 
     # 檢查 Image 模組
     try:
@@ -156,7 +199,6 @@ def main():
     print(f"[Info] Found {len(query_images)} query images.")
     print(f"[Info] Generating intrinsics (Auto-detect size, FOV={args.fov})...")
     
-    # [修改] 呼叫自動內參生成函式
     generate_query_list_with_intrinsics(
         query_list_path, query_images, args.query_dir, args.fov
     )
@@ -217,7 +259,7 @@ def main():
         
         block_q_list_path = work_dir / f"queries_{block.name}.txt"
         
-        # [修改] 針對此 Block 的影像再次生成內參列表 (因為 localize_sfm 需要獨立的 query list)
+        # 針對此 Block 的影像再次生成內參列表
         generate_query_list_with_intrinsics(
             block_q_list_path, q_list, args.query_dir, args.fov
         )

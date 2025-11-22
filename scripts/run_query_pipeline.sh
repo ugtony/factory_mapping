@@ -5,16 +5,35 @@
 # 執行一組新的 query 影像的定位。
 #
 # [更新功能]
-# 1. 支援 --fov 與 --global-conf 參數。
-# 2. 自動根據 FOV 計算內參 (解決手機直/橫拍問題)。
-# 3. 保留完整的視覺化輸出 (Retrieval + Matches)。
+# 1. 支援從 project_config.env 讀取 --fov 與 --global-conf 預設值。
+# 2. 統一參數名稱為 --global-conf。
+# 3. 自動根據 FOV 計算內參 (解決手機直/橫拍問題)。
 #
 set -euo pipefail
 
-# --- 0. 參數解析 ---
+# --- 0. 環境與設定檔讀取 ---
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/..")"
+CONFIG_FILE="${PROJECT_ROOT}/project_config.env"
+
+if [ -x "/opt/conda/bin/python" ]; then PY="/opt/conda/bin/python"; else PY="${PY:-python3}"; fi
+
+# 1. 硬編碼預設值
+DEFAULT_FOV="69.4"          # iPhone 1x
+DEFAULT_GLOBAL="netvlad"
+
+# 2. 嘗試載入設定檔
+if [ -f "${CONFIG_FILE}" ]; then
+  echo "[Init] Loading config from ${CONFIG_FILE}..."
+  source "${CONFIG_FILE}"
+fi
+
+# 3. 套用設定檔 (Config > Default)
+FOV_DEG="${FOV:-$DEFAULT_FOV}"
+GLOBAL_CONF="${GLOBAL_CONF:-$DEFAULT_GLOBAL}"
+
+# --- 1. 參數解析 (CLI Overrides) ---
 POSITIONAL_ARGS=()
-FOV_DEG="69.4"          # 預設 FOV (iPhone 1x)
-GLOBAL_CONF="netvlad"   # 預設 Global Model
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -26,11 +45,12 @@ while [[ $# -gt 0 ]]; do
       FOV_DEG="$2"
       shift 2
       ;;
-    --global-conf=*|--global_conf=*)
+    # 統一參數介面
+    --global-conf=*|--global_conf=*|--global_model=*)
       GLOBAL_CONF="${1#*=}"
       shift
       ;;
-    --global-conf|--global_conf)
+    --global-conf|--global_conf|--global_model)
       GLOBAL_CONF="$2"
       shift 2
       ;;
@@ -54,17 +74,10 @@ if [ $# -lt 2 ]; then
   echo "參數說明:"
   echo "  <BLOCK_DATA_DIR>:   包含 'db/' 和 'query/' 影像的資料夾"
   echo "  <BLOCK_OUTPUT_DIR>: 包含 'sfm/' 和特徵 H5 檔的資料夾"
-  echo "  --fov:              Query 相機的長邊視野角 (預設: 69.4)"
-  echo "  --global-conf:      全域特徵模型名稱 (預設: netvlad)"
+  echo "  --fov:              Query 相機的長邊視野角 (目前設定: ${FOV_DEG})"
+  echo "  --global-conf:      全域特徵模型名稱 (目前設定: ${GLOBAL_CONF})"
   echo ""
   exit 1
-fi
-
-# --- 1. 環境與路徑設定 ---
-if [ -x "/opt/conda/bin/python" ]; then
-  PY="/opt/conda/bin/python"
-else
-  PY="${PY:-python3}"
 fi
 
 BLOCK_DATA_DIR=$(realpath "$1")
@@ -135,7 +148,7 @@ if [ ! -f "${LOCAL_FEATS_H5}" ]; then
 fi
 if [ ! -f "${GLOBAL_FEATS_DB_H5}" ]; then
   echo "[Error] 缺少 Global 特徵檔案: ${GLOBAL_FEATS_DB_H5}"
-  echo "       (請確認 build_block_model.sh 是否使用了 --global=${GLOBAL_CONF})"
+  echo "       (請確認 build_block_model.sh 是否使用了 --global-conf=${GLOBAL_CONF})"
   exit 1
 fi
 if [ ! -f "${DB_LIST}" ]; then
@@ -246,7 +259,7 @@ echo "[7/8] 執行定位 (localize_sfm)..."
 
 echo "[8/8] 產生視覺化報告..."
 
-# 視覺化：檢索結果 (Retrieval) - 原始完整版
+# 視覺化：檢索結果 (Retrieval)
 export DATA_ROOT="${BLOCK_DATA_DIR}"
 export Q_LIST_RAW PAIRS_Q2DB VIZ_DIR
 export MAX_VIZ_IMAGES_RETRIEVAL=10
@@ -295,7 +308,7 @@ for q in queries:
 print(f"[Retrieval Viz] 寫入 {count} 張圖片到 {VIZ_DIR}")
 PY
 
-# 視覺化：本地化匹配 (Localization) - 原始完整版
+# 視覺化：本地化匹配 (Localization)
 export LOCAL_FEATS="${LOCAL_FEATS_H5}"
 export Q_MATCHES="${Q_MATCHES_H5}"
 export MAX_VIZ_IMAGES_LOCALIZATION=5
@@ -365,7 +378,6 @@ with h5py.File(str(LOCAL_FEATS), 'r') as ffeat, h5py.File(str(Q_MATCHES), 'r') a
         if isinstance(obj, h5py.Dataset) and name.endswith("/matches0"):
             matches_nodes.append(name)
     fmat.visititems(lambda n, o: visit(n, o))
-    print(f"[Info] 找到 {len(matches_nodes)} 個 'matches0' datasets")
     done = 0
     for q in queries:
         if q not in q2db_top1: continue
@@ -382,7 +394,7 @@ with h5py.File(str(LOCAL_FEATS), 'r') as ffeat, h5py.File(str(Q_MATCHES), 'r') a
             for node in matches_nodes:
                 if q_short in node and db_short in node: found = node; break
         if found is None:
-            print(f"[Skip] 找不到 ({q}, {db}) 的 matches0 dataset")
+            # print(f"[Skip] 找不到 ({q}, {db}) 的 matches0 dataset")
             continue
         
         m0 = np.array(fmat[found])
