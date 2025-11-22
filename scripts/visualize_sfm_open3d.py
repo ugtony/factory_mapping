@@ -2,8 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 visualize_sfm_open3d.py  —  彩色點雲 + DB/Query 相機（合併 legend）
+- [V3] 修正 360 模式下的採樣邏輯，改為「基於 Frame ID (時間戳)」進行採樣。
+- 移除 --mode 參數，改為自動偵測 360 模式（_F, _R ... 檔名）
 - 從 pycolmap Reconstruction 取彩色點雲（points3D.color / .rgb）
-- DB Cameras (紅色) 與 DB Labels（紅字）為各自單一 legend
+- DB Cameras (紅色/漸層) 與 DB Labels 為各自單一 legend
+- 若偵測到 360 模式，額外增加 "Front only" (_F) 視角圖層
 - Query Cameras (藍色) 與 Query Labels（藍字）為各自單一 legend（可選）
 - 匯出互動式 HTML；可選擇啟動簡易 HTTP server 預覽
 """
@@ -17,7 +20,7 @@ from http.server import SimpleHTTPRequestHandler
 from socketserver import TCPServer
 import plotly.graph_objects as go
 import plotly.io as pio
-
+from collections import defaultdict # [NEW] Import defaultdict
 
 # ---------- 3D 轉換輔助 ----------
 def qvec2rotmat(q):
@@ -29,15 +32,13 @@ def qvec2rotmat(q):
     ], dtype=np.float64)
 
 def build_camera_R_from_dir(view_dir, up_ref=np.array([0., 0., 1.])):
-    """由 viewing_direction 構造 cam->world 的旋轉矩陣（列向量為世界座標下的相機軸）"""
     z = view_dir / (np.linalg.norm(view_dir) + 1e-12)
     u = up_ref if abs(np.dot(z, up_ref)) < 0.98 else np.array([0., 1., 0.])
     x = np.cross(u, z); x /= (np.linalg.norm(x) + 1e-12)
     y = np.cross(z, x); y /= (np.linalg.norm(y) + 1e-12)
-    return np.stack([x, y, z], axis=1)  # columns=[x_world, y_world, z_world]
+    return np.stack([x, y, z], axis=1)
 
 def make_frustum_lines(C, R, scale=0.25):
-    """回傳一個相機金字塔的折線資料（xs,ys,zs），用 None 分段"""
     pts_cam = np.array([
         [0,0,0],[ 0.5, 0.3, 1.0],[-0.5, 0.3, 1.0],
         [-0.5,-0.3, 1.0],[ 0.5,-0.3, 1.0]
@@ -52,30 +53,42 @@ def make_frustum_lines(C, R, scale=0.25):
     return xs, ys, zs
 
 
-# ---------- 彩色點雲擷取（相容 color / rgb 欄位） ----------
+# ---------- 彩色點雲擷取 ----------
 def extract_colored_points(rec: pycolmap.Reconstruction):
     coords, colors = [], []
     for p in rec.points3D.values():
         coords.append(np.asarray(p.xyz, dtype=float))
-        if hasattr(p, "color"):
-            c = np.asarray(p.color)
-        elif hasattr(p, "rgb"):
-            c = np.asarray(p.rgb)
-        else:
-            c = np.array([204,204,204], dtype=float)  # 灰
+        c = np.asarray(p.rgb if hasattr(p, "rgb") else p.color, dtype=float)
         c = np.clip(c, 0, 255).astype(float)
         colors.append(f"rgb({int(c[0])},{int(c[1])},{int(c[2])})")
     if not coords:
         return None, None
     return np.vstack(coords), colors
 
+# ---------- 360 模式輔助函式 ----------
+SUFFIXES_360 = ('_F', '_R', '_B', '_L', '_FR', '_FL', '_RB', '_BL', '_LF')
 
-# ---------- 解析 hloc poses.txt（Query 位姿） ----------
+def detect_360_mode(rec: pycolmap.Reconstruction) -> bool:
+    for img in rec.images.values():
+        stem = os.path.splitext(img.name)[0]
+        if stem.endswith(SUFFIXES_360):
+            return True
+    return False
+
+def get_frame_id_360(image_name: str):
+    """
+    Extracts base frame ID from a 360 view name.
+    e.g., 'db/frames-000001_F.jpg' -> 'db/frames-000001'
+    Returns None if not a 360 view.
+    """
+    stem = os.path.splitext(image_name)[0]
+    if stem.endswith(SUFFIXES_360):
+        # 從最後一個 '_' 往前切
+        return stem.rsplit('_', 1)[0]
+    return None # Not a 360 view
+
+# ---------- 解析 Query 位姿 ----------
 def load_query_poses(path):
-    """
-    讀取每行：name qw qx qy qz tx ty tz
-    回傳 list of (name, C, R) 其中 C = -R^T t；R = cam->world
-    """
     if not path or not os.path.exists(path):
         print("[Info] No query poses provided or file not found.")
         return []
@@ -83,103 +96,69 @@ def load_query_poses(path):
     with open(path, "r") as f:
         for line in f:
             toks = line.strip().split()
-            if len(toks) < 8: 
-                continue
+            if len(toks) < 8: continue
             name = toks[0]
             q = np.array(list(map(float, toks[1:5])), dtype=np.float64)
             t = np.array(list(map(float, toks[5:8])), dtype=np.float64)
-            R_c_w = qvec2rotmat(q)     # 這是 world-to-cam 旋轉 (R_c_w)
-            R_w_c = R_c_w.T          # 轉置得到 cam-to-world (R_w_c)
-            C = -R_c_w.T @ t         # 計算相機中心 C_w (這行不變)
-            poses.append((name, C, R_w_c)) # <--- 傳入 R_w_c (修正後的 R)
-    print(f"[Info] Loaded {len(poses)} query poses from {path}.")
-    return poses
+            R_c_w = qvec2rotmat(q); R_w_c = R_c_w.T; C = -R_c_w.T @ t
+            poses.append((name, C, R_w_c))
     print(f"[Info] Loaded {len(poses)} query poses from {path}.")
     return poses
 
-# ---------- [修改] 繪製相機圖層的輔助函式 (支援漸層色與可見度) ----------
+# ---------- 繪製相機圖層 ----------
 def create_camera_traces(
-    image_list_with_indices, # List of (img, idx) tuples
-    total_db_count,          # Total number of cameras for normalization
-    suffix, 
-    colorscale,              # Plotly colorscale (e.g., 'Viridis', 'Reds')
-    legend_prefix, 
-    line_width=2, 
-    frustum_scale=0.25, 
-    text_size=9,
-    default_visible=False    # <<< 新增：控制預設可見度
+    image_list_with_indices, total_db_count, suffix, 
+    colorscale, legend_prefix, default_visible=False, **kwargs
 ):
-    """
-    處理一個 (pycolmap.Image, index) 物件列表，並回傳兩個 Plotly traces：
-    1. 相機錐台線條 (Scatter3d) - 帶有顏色梯度
-    2. 相機名稱標籤 (Scatter3d)
-    """
     all_xs, all_ys, all_zs = [], [], []
     label_names, label_xs, label_ys, label_zs = [], [], [], []
-    line_color_values = [] # <<< 新增：用於儲存每個點的顏色對應值
+    line_color_values = [] 
     
-    # 準備正規化 (避免除以 0)
     norm_denominator = float(max(1, total_db_count - 1))
 
-    # 遍歷傳入的 (已採樣) 列表
-    for img, idx in image_list_with_indices: # <<< 解開 (影像, 索引)
+    for img, idx in image_list_with_indices:
         try:
             C = np.array(img.projection_center()).ravel()
             v = np.array(img.viewing_direction()).ravel()
             v /= (np.linalg.norm(v) + 1e-12)
-            R = build_camera_R_from_dir(v) # 使用檔案中已有的函式
+            R = build_camera_R_from_dir(v)
             
-            # 取得相機錐台線條
-            xs, ys, zs = make_frustum_lines(C, R, scale=frustum_scale) # 使用檔案中已有的函式
-            all_xs += xs
-            all_ys += ys
-            all_zs += zs
+            xs, ys, zs = make_frustum_lines(C, R, scale=kwargs.get("frustum_scale", 0.25))
+            all_xs += xs; all_ys += ys; all_zs += zs
             
-            # <<< 新增：為線條上的每個點指定 0.0 ~ 1.0 的顏色值 >>>
-            color_val = float(idx) / norm_denominator # 正規化索引
-            line_color_values.extend([color_val] * len(xs)) # 為這個相機的所有線條點指定相同顏色值
+            color_val = float(idx) / norm_denominator
+            line_color_values.extend([color_val] * len(xs))
             
-            # 取得標籤
             label_names.append(img.name)
-            label_xs.append(C[0])
-            label_ys.append(C[1])
-            label_zs.append(C[2])
+            label_xs.append(C[0]); label_ys.append(C[1]); label_zs.append(C[2])
         except Exception as e:
-            continue # 略過有問題的影像
+            continue
     
-    # 1. 建立線條圖層
     line_trace = go.Scatter3d(
         x=all_xs, y=all_ys, z=all_zs,
         mode="lines",
-        line=dict(
-            width=line_width,
-            color=line_color_values, # <<< 指定顏色陣列
-            colorscale=colorscale      # <<< 指定色階
-        ),
-        marker=dict( # <<< 必須有 marker 才能顯示 colorscale
-            size=0.1, # 設為不可見
-            color=line_color_values, # 顏色陣列
-            colorscale=colorscale,
-            showscale=(suffix == "100%"), # <<< [Req 1] 只在 100% 圖層顯示色條
+        line=dict(width=kwargs.get("line_width", 2), color=line_color_values, colorscale=colorscale),
+        marker=dict(
+            size=0.1, color=line_color_values, colorscale=colorscale,
+            showscale=(suffix == "100%"), 
             colorbar=dict(title="Time", tickvals=[0.0, 1.0], ticktext=['Start', 'End'])
         ),
-        name=f"{legend_prefix} Cameras ({suffix})", # e.g., "DB Cameras (50%)"
+        name=f"{legend_prefix} Cameras ({suffix})",
         legendgroup=f"{legend_prefix}_cam_{suffix}", 
         showlegend=True,
-        visible=True if default_visible else "legendonly" # <<< [Req 2] 根據參數設定可見度
+        visible=True if default_visible else "legendonly"
     )
     
-    # 2. 建立標籤圖層
     label_trace = go.Scatter3d(
         x=label_xs, y=label_ys, z=label_zs,
         mode="text",
         text=label_names,
         textposition="top center",
-        textfont=dict(size=text_size, color="red"), # 標籤保持紅色易讀
-        name=f"{legend_prefix} Labels ({suffix})", # e.g., "DB Labels (50%)"
+        textfont=dict(size=kwargs.get("text_size", 9), color="red"),
+        name=f"{legend_prefix} Labels ({suffix})",
         legendgroup=f"{legend_prefix}_label_{suffix}", 
         showlegend=True,
-        visible="legendonly" # <<< [Req 2] 標籤預設全隱藏
+        visible="legendonly" 
     )
     
     return line_trace, label_trace
@@ -191,6 +170,10 @@ def main(sfm_dir, output_dir, port=8080, query_poses=None, no_server=False):
 
     print(f"[Load] Reading reconstruction from: {sfm_dir}")
     rec = pycolmap.Reconstruction(sfm_dir)
+
+    is_360_mode = detect_360_mode(rec)
+    mode_str = "360 (auto-detected)" if is_360_mode else "std"
+    print(f"[Info] Mode: {mode_str}")
 
     data = []
 
@@ -205,74 +188,96 @@ def main(sfm_dir, output_dir, port=8080, query_poses=None, no_server=False):
             legendgroup="pcd", showlegend=True
         ))
     else:
-        print("[Warn] No 3D points found; colored point cloud skipped.")
+        print("[Warn] No 3D points found.")
 
     # --- DB Cameras (Multi-level Sampling) ---
     print("[Info] Sorting and sampling DB cameras...")
     
-    # 1. 排序：先依照影像名稱排序，確保順序性
     try:
         all_db_images_sorted = sorted(rec.images.values(), key=lambda img: img.name)
     except Exception as e:
-        # 備用排序（如果 .name 不可用）
         all_db_images_sorted = sorted(rec.images.values(), key=lambda img: img.image_id)
         
-    # <<< 修改：建立 (影像, 索引) 的元組列表 >>>
     db_images_with_indices = [(img, i) for i, img in enumerate(all_db_images_sorted)]
     total_db_count = len(db_images_with_indices)
-    
-    # <<< 新增：定義要用於時間漸層的色階 >>>
-    db_colorscale = 'Reds'  # 從淺紅到深紅
-    db_colorscale = 'Viridis'  # 從藍綠到黃色
+    db_colorscale = 'Viridis' 
     
     if total_db_count > 0:
-        # 2. 定義您要的採樣率 (名稱, 百分比)
-        sample_rates = [
-            ("100%", 100.0),
-            ("50%", 50.0),
-            ("25%", 25.0),
-            ("12.5%", 12.5)
-        ]
         
-        # 3. 迭代採樣率，產生圖層
-        for suffix, rate in sample_rates:
+        # [MODIFIED] 根據模式決定採樣的 "單位"
+        if is_360_mode:
+            print("[Info] 360 Mode: Grouping cameras by frame ID...")
+            frame_groups = defaultdict(list)
+            for img, idx in db_images_with_indices:
+                frame_id = get_frame_id_360(img.name)
+                if frame_id:
+                    frame_groups[frame_id].append((img, idx))
+                else:
+                    #  fallback (例如有些圖不符合 _F 命名)
+                    frame_groups[f"non_360_{img.name}"].append((img, idx))
             
-            # 4. 計算要取的數量 (至少 2 個，即頭尾)
-            target_num = int(round(total_db_count * (rate / 100.0)))
+            # 採樣的基礎單位是 Frame ID
+            sampling_base_list = sorted(frame_groups.keys())
+            total_sample_units = len(sampling_base_list)
+            print(f"    > Found {total_sample_units} unique frames (time steps).")
+        else:
+            # 標準模式：採樣的基礎單位是單張影像
+            sampling_base_list = db_images_with_indices
+            total_sample_units = len(sampling_base_list)
+
+        # 1. 標準採樣率圖層
+        sample_rates = [("100%", 100.0), ("50%", 50.0), ("25%", 25.0), ("12.5%", 12.5)]
+        
+        for suffix, rate in sample_rates:
+            target_num = int(round(total_sample_units * (rate / 100.0)))
             target_num = max(target_num, 2) 
             
-            if target_num >= total_db_count: # (改為 >= 增加穩健性)
-                # 如果採樣數大於總數，就全取
-                indices = np.arange(total_db_count)
+            if target_num >= total_sample_units:
+                indices = np.arange(total_sample_units)
             else:
-                # 5. 使用 np.linspace 產生等距索引，這會自動包含 0 (頭) 和 total_db_count-1 (尾)
-                indices = np.linspace(0, total_db_count - 1, num=target_num, dtype=int)
+                indices = np.linspace(0, total_sample_units - 1, num=target_num, dtype=int)
             
-            # 確保索引唯一
             indices = sorted(list(set(indices)))
             
-            # <<< 修改：根據索引取得 (影像, 索引) 列表 >>>
-            sampled_list_with_indices = [db_images_with_indices[i] for i in indices]
+            # [MODIFIED] 根據採樣單位，建立最終的相機列表
+            sampled_list = []
+            if is_360_mode:
+                for i in indices:
+                    frame_id = sampling_base_list[i]
+                    sampled_list.extend(frame_groups[frame_id])
+            else:
+                # 標準模式
+                sampled_list = [sampling_base_list[i] for i in indices]
+
+            print(f"    > Sampling {suffix}: {len(sampled_list)} cameras (from {len(indices)} sample units)")
             
-            print(f"    > Sampling {suffix}: {len(sampled_list_with_indices)} cameras")
-            
-            # <<< 修改：判斷是否為 100% 圖層 (用於設定預設可見度) >>>
-            is_100_percent_trace = (suffix == "100%")
-            
-            # 6. 呼叫新的輔助函式來產生線條和標籤圖層
-            line_trace, label_trace = create_camera_traces(
-                image_list_with_indices=sampled_list_with_indices, # <<< 傳入 (影像, 索引) 列表
-                total_db_count=total_db_count,                     # <<< 傳入總數
-                suffix=suffix,
-                colorscale=db_colorscale,                          # <<< 傳入色階
-                legend_prefix="DB",
-                default_visible=is_100_percent_trace               # <<< [Req 2] 傳入可見度
+            is_100_percent = (suffix == "100%")
+            line_tr, label_tr = create_camera_traces(
+                sampled_list, total_db_count, suffix, db_colorscale, "DB",
+                default_visible=is_100_percent
             )
+            data.append(line_tr)
+            data.append(label_tr)
+
+        # 2. [360] Front-only layer (此圖層維持原邏輯：顯示 *所有* Front 視角，不受採樣率影響)
+        if is_360_mode:
+            print("[Info] Generating 'Front-only' camera trace (all frames)...")
+            front_only_list = []
+            for img, idx in db_images_with_indices:
+                if os.path.splitext(img.name)[0].endswith("_F"):
+                    front_only_list.append((img, idx))
             
-            # 7. 將圖層加入到 'data' 列表中
-            data.append(line_trace)
-            data.append(label_trace)
-            
+            if front_only_list:
+                print(f"    > Found {len(front_only_list)} total front-view cameras.")
+                line_tr_F, label_tr_F = create_camera_traces(
+                    front_only_list, total_db_count, "Front", db_colorscale, "DB",
+                    default_visible=False 
+                )
+                data.append(line_tr_F)
+                data.append(label_tr_F)
+            else:
+                print("[Warn] Auto-detected 360 mode but no '_F' images found.")
+
     else:
         print("[Warn] No DB cameras found in reconstruction.")
         
@@ -293,7 +298,6 @@ def main(sfm_dir, output_dir, port=8080, query_poses=None, no_server=False):
             line=dict(width=2, color="blue"),
             name="Query Cameras",
             legendgroup="qcam", showlegend=True
-            # (Query 預設為 True)
         ))
         data.append(go.Scatter3d(
             x=q_lx, y=q_ly, z=q_lz,
@@ -303,31 +307,17 @@ def main(sfm_dir, output_dir, port=8080, query_poses=None, no_server=False):
             textfont=dict(size=10, color="blue"),
             name="Query Labels",
             legendgroup="qlabel", showlegend=True
-            # (Query 預設為 True)
         ))
 
     # --- 圖表設定與輸出 ---
     fig = go.Figure(data=data)
     fig.update_layout(
-        title="SfM + Cameras (DB=Red, Query=Blue)",
+        title=f"SfM Visualization (Mode: {mode_str})",
         scene=dict(
-            xaxis_title='X', 
-            yaxis_title='Y', 
-            zaxis_title='Z (Up)', # 標記 Z 軸為 "Up"
-            aspectmode="data", # 保持長寬比
-            
-            # 1. 強制 Z 軸為「上」方向
-            camera=dict(
-                up=dict(x=0, y=0, z=1),
-                
-                # 2. 設置一個合理的初始視角
-                eye=dict(x=-0.5, y=-2.5, z=0.5) 
-            ),
-            
-            # 3. 更改滑鼠旋轉模式為 "orbit"
+            xaxis_title='X', yaxis_title='Y', zaxis_title='Z (Up)',
+            aspectmode="data",
+            camera=dict(up=dict(x=0, y=0, z=1), eye=dict(x=-0.5, y=-2.5, z=0.5)),
             dragmode="orbit",
-            
-            # 4. 顯示 XY/XZ/YZ 網格平面
             xaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.3)', zeroline=False),
             yaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.3)', zeroline=False),
             zaxis=dict(showgrid=True, gridcolor='rgba(128,128,128,0.3)', zeroline=False),
@@ -338,7 +328,7 @@ def main(sfm_dir, output_dir, port=8080, query_poses=None, no_server=False):
     pio.write_html(fig, html_path, include_plotlyjs="cdn", full_html=True)
     print(f"✅ Exported HTML: {html_path}")
 
-    # --- 簡易 HTTP server（可選） ---
+    # --- 簡易 HTTP server ---
     if not no_server:
         os.chdir(output_dir)
         url = f"http://localhost:{port}/{os.path.basename(html_path)}"
@@ -361,5 +351,7 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=8080, help="HTTP server port")
     ap.add_argument("--query_poses", type=str, help="Optional: path to hloc poses.txt")
     ap.add_argument("--no_server", action="store_true", help="Only export HTML, do not start HTTP server")
+    
     args = ap.parse_args()
+    
     main(args.sfm_dir, args.output_dir, args.port, args.query_poses, args.no_server)

@@ -1,28 +1,65 @@
 #!/usr/bin/env bash
-# build_block_model.sh
-# 針對單一 block 區域執行離線建模（HLOC pipeline）。
-#
-# - 自動檢查 local H5 特徵的完整性，若不符則重建。
-# - 自動潔淨化 pairs list，避免 H5 中不存在的影像鍵名。
-# - [STEP 9] 內建 HLOC SfM 模型選擇 bug 的修復程序（選最大模型）。
-# - [STEP 10] 對齊 SfM 至 Z-Up（採用 align_sfm_model_z_up.py），並輸出視覺化。
-# - 支援 staging（鏡射）或直接讀取影像。
-# - 可選啟動內建 HTTP 伺服器預覽 HTML。
+# build_block_model.sh [V8-Configurable Global Model]
+# - Update: 支援 --global-conf 參數 (netvlad / megaloc)。
+# - Update: 移除 USE_STAGE 參數，強制使用 Staging 模式。
+# - Fix: 使用 db.txt 白名單與實體複製 (避開 Symlink)，徹底解決 COLMAP 資料庫路徑不匹配導致的 KeyError。
 
 set -euo pipefail
-set -x # 開啟 debug 輸出，若嫌吵可註解此行
 
+# -------- 0. 參數解析 --------
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 <BLOCK_DATA_DIR>"
-  echo "Example: $0 data/block_001"
+  echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=FLOAT] [--global-conf=STR]"
+  echo "  --mode:        std (default) or 360"
+  echo "  --dense:       (360 mode) Use 8 views instead of 4"
+  echo "  --fov:         (360 mode) Override FOV (Auto-calculated if unset)"
+  echo "  --global-conf: Global feature model (default: netvlad)"
   exit 1
 fi
 
-# -------- 1. 路徑與環境設定 --------
 DATA_DIR="$(realpath "$1")"
-BLOCK_NAME="$(basename "${DATA_DIR}")"
+shift
 
-# 以腳本所在目錄作為專案根目錄
+# 預設參數
+CAM_MODE="std"
+DENSE_360=0
+FOV_360="AUTO" 
+GLOBAL_CONF="netvlad"  # 預設全域特徵模型
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode=*) 
+      CAM_MODE="${1#*=}" 
+      ;;
+    --dense)  
+      DENSE_360=1 
+      ;;
+    --fov=*)  
+      FOV_360="${1#*=}" 
+      ;;
+    --global-conf=*|--global_conf=*) 
+      GLOBAL_CONF="${1#*=}" 
+      ;;
+    --global-conf|--global_conf) 
+      GLOBAL_CONF="$2"
+      shift 
+      ;;
+    *) 
+      ;;
+  esac
+  shift
+done
+
+# 智慧 FOV 預設值邏輯
+if [ "${CAM_MODE}" = "360" ] && [ "${FOV_360}" = "AUTO" ]; then
+  if [ "${DENSE_360}" = "1" ]; then
+    FOV_360=100.0  # 8視角
+  else
+    FOV_360=120.0  # 4視角
+  fi
+fi
+
+# -------- 1. 路徑與環境設定 --------
+BLOCK_NAME="$(basename "${DATA_DIR}")"
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/..")"
 OUT_ROOT="${PROJECT_ROOT}/outputs-hloc"
@@ -33,102 +70,114 @@ DBG_DIR="${OUT_DIR}/debug"
 
 mkdir -p "${OUT_DIR}" "${LOG_DIR}" "${VIZ_DIR}" "${DBG_DIR}"
 
-# Python
-if [ -x "/opt/conda/bin/python" ]; then
-  PY="/opt/conda/bin/python"
-else
-  PY="${PY:-python3}"
+if [ -x "/opt/conda/bin/python" ]; then PY="/opt/conda/bin/python"; else PY="${PY:-python3}"; fi
+
+echo "========================================"
+echo "[Info] Block: ${BLOCK_NAME}"
+echo "[Info] Mode: ${CAM_MODE^^}"
+echo "[Info] Global Model: ${GLOBAL_CONF}"
+if [ "${CAM_MODE}" = "360" ]; then
+  [ "${DENSE_360}" = "1" ] && V_TYPE="Dense(8)" || V_TYPE="Sparse(4)"
+  echo "[Info] 360 Settings: ${V_TYPE}, FOV=${FOV_360}"
 fi
-echo "[Info] Using Python executable at: $PY"
-echo "[Info] Processing Block: ${BLOCK_NAME}"
-echo "[Info] Output directory: ${OUT_DIR}"
+echo "[Info] Output: ${OUT_DIR}"
+echo "========================================"
 
 # -------- 2. 組態設定 --------
-GLOBAL_CONF="netvlad"
+# GLOBAL_CONF 已在上方解析
 LOCAL_CONF="superpoint_aachen"
 MATCHER_CONF="superpoint+lightglue"
 
-USE_STAGE="${USE_STAGE:-1}"         # 1=使用 staging；0=直接用 ${DATA_DIR}/db
-REBUILD_SFM="${REBUILD_SFM:-0}"     # 1=每次重建 SfM 目錄；0=沿用
-ALIGN_SFM="${ALIGN_SFM:-1}"         # 1=執行 Z-Up 對齊；0=跳過
-NUM_RETRIEVAL="${NUM_RETRIEVAL:-0}" # 檢索配對數
-SEQ_WINDOW="${SEQ_WINDOW:-5}"       # 時序配對窗口
-
-# NUM_RETRIEVAL 和 SEQ_WINDOW 不能同時為 0
-if [ "${NUM_RETRIEVAL}" -le 0 ] && [ "${SEQ_WINDOW}" -le 0 ]; then
-  echo "[Error] NUM_RETRIEVAL and SEQ_WINDOW cannot both be 0."
-  echo "        At least one must be > 0 for pair generation."
-  exit 1
-fi
+REBUILD_SFM="${REBUILD_SFM:-0}"
+ALIGN_SFM="${ALIGN_SFM:-1}"
+NUM_RETRIEVAL="${NUM_RETRIEVAL:-10}"
+SEQ_WINDOW="${SEQ_WINDOW:-5}"
 
 # -------- 3. 核心檔案路徑 --------
 DB_LIST="${OUT_DIR}/db.txt"
 LOCAL_FEATS="${OUT_DIR}/local-${LOCAL_CONF}.h5"
 GLOBAL_FEATS="${OUT_DIR}/global-${GLOBAL_CONF}.h5"
-PAIRS_DB="${OUT_DIR}/pairs-db-retrieval_and_seq.txt"
-PAIRS_DB_CLEAN="${OUT_DIR}/_pairs-db-retrieval.clean.txt"
+PAIRS_DB="${OUT_DIR}/pairs-raw.txt"
+PAIRS_DB_CLEAN="${OUT_DIR}/pairs-clean.txt"
 DB_MATCHES="${OUT_DIR}/db-matches-${MATCHER_CONF}.h5"
 SFM_DIR="${OUT_DIR}/sfm"
 SFM_MODELS_DIR="${SFM_DIR}/models"
+# [重要] 這是強制使用的隔離區路徑
 STAGE="${OUT_DIR}/_images_stage"
-# 對齊後輸出目錄（以專案根與 OUT_DIR 為基準）
 SFM_ALIGNED="${OUT_DIR}/sfm_aligned"
 
 ALIGN_SCRIPT="${PROJECT_ROOT}/scripts/align_sfm_model_z_up.py"
 VIZ_SCRIPT="${PROJECT_ROOT}/scripts/visualize_sfm_open3d.py"
+CONVERT_360_SCRIPT="${PROJECT_ROOT}/scripts/convert360_to_pinhole.py"
+PAIRS_360_SCRIPT="${PROJECT_ROOT}/scripts/pairs_from_360.py"
+PAIRS_STD_SCRIPT="${PROJECT_ROOT}/scripts/pairs_from_retrieval_and_sequential.py"
 
-# -------- 4. HLOC Pipeline (共 8 步) --------
-
-echo "[1/8] Generating DB image list (db.txt)..."
-(cd "${DATA_DIR}" && find db -maxdepth 3 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | sort) > "${DB_LIST}"
-if [ ! -s "${DB_LIST}"; then
-  echo "[Error] No images found in ${DATA_DIR}/db. Aborting."
-  exit 1
+# -------- [Step 0] 360 前處理 --------
+if [ "${CAM_MODE}" = "360" ]; then
+  echo "[0] (360 Mode) Converting Equirectangular to Pinhole..."
+  SRC_360="${DATA_DIR}/db_360"
+  DST_DB="${DATA_DIR}/db"
+  # 檢查來源
+  if [ ! -d "${SRC_360}" ]; then echo "[Error] Missing ${SRC_360}"; exit 1; fi
+  
+  CONVERT_ARGS=( "--input_dir" "${SRC_360}" "--output_dir" "${DST_DB}" "--fov" "${FOV_360}" )
+  if [ "${DENSE_360}" = "1" ]; then CONVERT_ARGS+=( "--dense" ); fi
+  "${PY}" "${CONVERT_360_SCRIPT}" "${CONVERT_ARGS[@]}"
 fi
+
+# -------- HLOC Pipeline --------
+echo "[1] Generating DB image list (db.txt)..."
+if [ ! -d "${DATA_DIR}/db" ]; then echo "[Error] ${DATA_DIR}/db not found."; exit 1; fi
+# 確保只列出 db 資料夾內的影像
+(cd "${DATA_DIR}" && find db -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.png' \) | sort) > "${DB_LIST}"
+if [ ! -s "${DB_LIST}" ]; then echo "[Error] No images in db/."; exit 1; fi
 echo "    > Found $(wc -l < "${DB_LIST}") DB images."
 
-echo "[2/8] Checking integrity of local features H5 (${LOCAL_FEATS})..."
-${PY} - <<PY || { echo "[Check] H5 is stale/corrupted. Deleting."; rm -f "${LOCAL_FEATS}"; }
-import h5py, sys
-from pathlib import Path
+echo "[2] Checking integrity of local features H5..."
+${PY} - <<PY || { echo "[Check] H5 stale/corrupted. Deleting."; rm -f "${LOCAL_FEATS}"; }
+import h5py, sys; from pathlib import Path
 db_paths=[l.strip() for l in Path("${DB_LIST}").read_text().splitlines() if l.strip()]
 ok=True
 try:
     with h5py.File("${LOCAL_FEATS}","r") as f:
         for p in db_paths:
             if p not in f or "keypoints" not in f[p]:
-                print(f"[Check] Missing key '{p}'.", file=sys.stderr); ok=False; break
-except Exception as e:
-    print(f"[Check] Cannot open H5: {e}", file=sys.stderr); ok=False
+                print(f"[Check] Missing key '{p}'", file=sys.stderr); ok=False; break
+except Exception: ok=False
 sys.exit(0 if ok else 1)
 PY
 
-echo "[3/8] Extracting LOCAL features (${LOCAL_CONF})..."
+echo "[3] Extracting LOCAL features (${LOCAL_CONF})..."
 ${PY} -m hloc.extract_features --conf "${LOCAL_CONF}" \
   --image_dir "${DATA_DIR}" --image_list "${DB_LIST}" \
   --export_dir "${OUT_DIR}" --feature_path "${LOCAL_FEATS}"
 
-echo "[4/8] Extracting GLOBAL features (${GLOBAL_CONF})..."
+echo "[4] Extracting GLOBAL features (${GLOBAL_CONF})..."
 ${PY} -m hloc.extract_features --conf "${GLOBAL_CONF}" \
   --image_dir "${DATA_DIR}" --image_list "${DB_LIST}" \
   --export_dir "${OUT_DIR}" --feature_path "${GLOBAL_FEATS}"
 
-echo "[5/8] Building DB pairs (retrieval + sequential)..."
-if [ -f "${PAIRS_DB}" ]; then
-  echo "    > Exists: ${PAIRS_DB}. Skipping pair generation."
+echo "[5] Building DB pairs..."
+if [ "${CAM_MODE}" = "360" ]; then
+  echo "    > [360 Mode] Using explicit geometric pairing..."
+  PAIRS_ARGS=( "--db_list" "${DB_LIST}" "--output" "${PAIRS_DB}" "--seq_window" "${SEQ_WINDOW}" )
+  IS_FOV_GT_90=$(awk -v f="${FOV_360}" 'BEGIN {print (f > 90 ? 1 : 0)}')
+  if [ "${IS_FOV_GT_90}" -eq 1 ]; then
+      echo "      - FOV > 90 (${FOV_360}), enabling intra-frame matching."
+      PAIRS_ARGS+=( "--intra_match" )
+  fi
+  "${PY}" "${PAIRS_360_SCRIPT}" "${PAIRS_ARGS[@]}"
 else
-  ${PY} "${PROJECT_ROOT}/scripts/pairs_from_retrieval_and_sequential.py" \
-    --db_list "${DB_LIST}" \
-    --global_feats "${GLOBAL_FEATS}" \
-    --num_retrieval "${NUM_RETRIEVAL}" \
-    --seq_window "${SEQ_WINDOW}" \
+  echo "    > [Std Mode] Using retrieval + sequential pairing..."
+  "${PY}" "${PAIRS_STD_SCRIPT}" \
+    --db_list "${DB_LIST}" --global_feats "${GLOBAL_FEATS}" \
+    --num_retrieval "${NUM_RETRIEVAL}" --seq_window "${SEQ_WINDOW}" \
     --output "${PAIRS_DB}"
 fi
 
-echo "[6/8] Cleaning pairs list (ensure all keys exist in H5)..."
+echo "[6] Cleaning pairs list..."
 ${PY} - <<PY
-from pathlib import Path
-import h5py, sys
+from pathlib import Path; import h5py, sys
 pairs_in = Path("${PAIRS_DB}"); pairs_out = Path("${PAIRS_DB_CLEAN}")
 db_list = set([l.strip() for l in Path("${DB_LIST}").read_text().splitlines() if l.strip()])
 try:
@@ -138,20 +187,15 @@ try:
             s=line.strip().split()
             if len(s)<2: continue
             a,b = s[0], s[1]
-            ok = (a in db_list) and (b in db_list)
-            ok = ok and (a in f) and (b in f) and ("keypoints" in f[a]) and ("keypoints" in f[b])
-            if ok:
+            if (a in db_list) and (b in db_list) and (a in f) and (b in f):
                 fo.write(line); keep+=1
-            else:
-                drop+=1
-        print(f"[Check] Pairs cleaned: {keep} kept, {drop} dropped. -> {pairs_out}")
-except Exception as e:
-    print(f"[Error] Clean pairs failed: {e}", file=sys.stderr); sys.exit(1)
+            else: drop+=1
+        print(f"    > Pairs cleaned: {keep} kept, {drop} dropped.")
+except Exception as e: print(f"[Error] Clean failed: {e}", file=sys.stderr); sys.exit(1)
 PY
-
 PAIRS_USE="${PAIRS_DB_CLEAN}"
 
-echo "[7/8] Matching DB pairs (${MATCHER_CONF})..."
+echo "[7] Matching DB pairs (${MATCHER_CONF})..."
 ${PY} - <<PY
 from pathlib import Path
 from hloc import match_features
@@ -163,125 +207,86 @@ match_features.main(
 )
 PY
 
-echo "[8/8] Preparing images for SfM (Staging/Direct)..."
-set +x
-if [ "${USE_STAGE}" = "1" ]; then
-  echo "    > Using staging at: ${STAGE}"
-  rm -rf "${STAGE}"; mkdir -p "${STAGE}"
-  while IFS= read -r rel; do
-    src="${DATA_DIR}/${rel}"
-    dst="${STAGE}/${rel}"
-    mkdir -p "$(dirname "${dst}")"
-    ln -sf "${src}" "${dst}"
+echo "[8] Running SfM reconstruction..."
+if [ "${REBUILD_SFM}" = "1" ]; then rm -rf "${SFM_DIR}"; fi
+if [ -f "${SFM_DIR}/images.bin" ]; then
+  echo "    > SfM exists. Skipping."
+else
+  # ==============================================================================
+  # [CRITICAL FIX] 強制建立乾淨的 Staging 隔離區
+  # 原因 1: 避免 COLMAP 掃描到 raw/ 或 db_360/ 等無關檔案，導致資料庫污染。
+  # 原因 2: 避免使用 Symlink (ln -s)，因為 COLMAP 可能解析回絕對路徑 (../../../data/...)
+  #         導致與 hloc 特徵檔 (db/...) 的 Key 不匹配，引發 KeyError。
+  # 作法:   依據 db.txt 白名單，使用 Hard Link 或 Copy 將圖片放入 _images_stage。
+  # ==============================================================================
+  echo "    > [Fix] Staging images from db.txt to clean directory..."
+  rm -rf "${STAGE}"
+  mkdir -p "${STAGE}"
+  
+  count=0
+  while read -r rel_path; do
+      [ -z "$rel_path" ] && continue
+      
+      SRC_FILE="${DATA_DIR}/${rel_path}"
+      DST_FILE="${STAGE}/${rel_path}"
+      DST_DIR="$(dirname "${DST_FILE}")"
+      
+      if [ -f "${SRC_FILE}" ]; then
+          mkdir -p "${DST_DIR}"
+          # 優先嘗試 Hard Link (快速且無路徑解析問題)，失敗則退回 Copy
+          ln "${SRC_FILE}" "${DST_FILE}" 2>/dev/null || cp "${SRC_FILE}" "${DST_FILE}"
+          count=$((count+1))
+      fi
   done < "${DB_LIST}"
+  
+  echo "      - Staged ${count} images to ${STAGE}"
   IMG_DIR="${STAGE}"
-else
-  IMG_DIR="${DATA_DIR}"
-  echo "    > Using direct path: ${IMG_DIR}"
-fi
-set -x
 
-if [ "${REBUILD_SFM}" = "1" ]; then
-  echo "    > REBUILD_SFM=1. Cleaning previous SfM directory."
-  rm -rf "${SFM_DIR}"
-fi
-
-if [ -f "${SFM_DIR}/images.bin" ]; then
-  echo "    > SfM exists at ${SFM_DIR}. Skipping reconstruction."
-else
-  echo "[Run] SfM reconstruction (COLMAP via HLOC)..."
+  # 執行 hloc 重建
   ${PY} -m hloc.reconstruction \
-    --image_dir "${IMG_DIR}" \
-    --pairs "${PAIRS_USE}" \
-    --features "${LOCAL_FEATS}" \
-    --matches "${DB_MATCHES}" \
+    --image_dir "${IMG_DIR}" --pairs "${PAIRS_USE}" \
+    --features "${LOCAL_FEATS}" --matches "${DB_MATCHES}" \
     --sfm_dir "${SFM_DIR}" | tee "${LOG_DIR}/reconstruction.log"
-  echo "[Done] SfM model: ${SFM_DIR}"
 fi
 
-# -------- STEP 9) HLOC Model Selection BUGFIX（選最大模型） --------
-echo "[9] Verifying HLOC selected the largest SfM model..."
-NEED_SWAP=false
-BEST_MODEL_PATH=""
-MAX_IMG_COUNT=0
-ROOT_IMG_COUNT=0
-
+echo "[9] Verifying SfM model..."
+NEED_SWAP=false; BEST_MODEL_PATH=""; MAX_IMG_COUNT=0; ROOT_IMG_COUNT=0
 if [ -f "${SFM_DIR}/images.bin" ]; then
-  ROOT_IMG_COUNT=$(${PY} -c "import pycolmap, sys; rec=pycolmap.Reconstruction(sys.argv[1]); print(len(rec.images))" "${SFM_DIR}")
+    ROOT_IMG_COUNT=$(${PY} -c "import pycolmap, sys; print(len(pycolmap.Reconstruction(sys.argv[1]).images))" "${SFM_DIR}" 2>/dev/null || echo 0)
 else
-  echo "[Fix]   > Warning: No images.bin in ${SFM_DIR}. Will search in models/."
-  MAX_IMG_COUNT=1
+    echo "    [Warn] No images.bin in root. Searching models/..."
 fi
-
 if [ -d "${SFM_MODELS_DIR}" ]; then
   for MODEL_DIR in "${SFM_MODELS_DIR}"/*; do
     if [ -d "${MODEL_DIR}" ] && [ -f "${MODEL_DIR}/images.bin" ]; then
-      CURRENT_IMG_COUNT=$(${PY} -c "import pycolmap, sys; rec=pycolmap.Reconstruction(sys.argv[1]); print(len(rec.images))" "${MODEL_DIR}")
-      if [ "${CURRENT_IMG_COUNT}" -gt "${MAX_IMG_COUNT}" ]; then
-        MAX_IMG_COUNT="${CURRENT_IMG_COUNT}"
-        BEST_MODEL_PATH="${MODEL_DIR}"
-      fi
+      CNT=$(${PY} -c "import pycolmap, sys; print(len(pycolmap.Reconstruction(sys.argv[1]).images))" "${MODEL_DIR}" 2>/dev/null || echo 0)
+      if [ "${CNT}" -gt "${MAX_IMG_COUNT}" ]; then MAX_IMG_COUNT="${CNT}"; BEST_MODEL_PATH="${MODEL_DIR}"; fi
     fi
   done
 fi
-
 if [ "${ROOT_IMG_COUNT}" -lt "${MAX_IMG_COUNT}" ] && [ -n "${BEST_MODEL_PATH}" ]; then
-  echo "[Fix]   > Root (${ROOT_IMG_COUNT}) < Best (${MAX_IMG_COUNT}). Swapping..."
-  NEED_SWAP=true
-else
-  echo "[Fix]   > Selection OK (Root: ${ROOT_IMG_COUNT})."
-fi
-
-if [ "${NEED_SWAP}" = true ]; then
-  TMP_SWAP_DIR="${SFM_DIR}/_tmp_swap_$(date +%s)"
-  mkdir -p "${TMP_SWAP_DIR}"
-  find "${SFM_DIR}" -maxdepth 1 -type f -name "*.bin" -exec mv {} "${TMP_SWAP_DIR}/" \;
+  echo "    [Fix] Swapping root (${ROOT_IMG_COUNT}) with best (${MAX_IMG_COUNT}) from ${BEST_MODEL_PATH##*/}..."
+  TMP="${SFM_DIR}/_swap"; mkdir -p "${TMP}"
+  find "${SFM_DIR}" -maxdepth 1 -type f -name "*.bin" -exec mv {} "${TMP}/" \;
   find "${BEST_MODEL_PATH}" -maxdepth 1 -type f -name "*.bin" -exec mv {} "${SFM_DIR}/" \;
-  find "${TMP_SWAP_DIR}" -maxdepth 1 -type f -name "*.bin" -exec mv {} "${BEST_MODEL_PATH}/" \;
-  rm -rf "${TMP_SWAP_DIR}"
-  echo "[Fix]   > Swap complete. ${SFM_DIR} now holds the largest model (${MAX_IMG_COUNT} images)."
+  find "${TMP}" -maxdepth 1 -type f -name "*.bin" -exec mv {} "${BEST_MODEL_PATH}/" \;
+  rm -rf "${TMP}"; ROOT_IMG_COUNT=${MAX_IMG_COUNT}
+else
+  echo "    > Selection OK (Root: ${ROOT_IMG_COUNT}, Max: ${MAX_IMG_COUNT})."
 fi
 
-# -------- STEP 10) Align to Z-Up + Visualization --------
-# 對齊：輸出到 ${SFM_ALIGNED}；視覺化預設使用對齊後模型（若跳過對齊則回退到原 sfm）
 echo "[10] Align to Z-Up & Visualize"
-USE_VIZ_DIR="${VIZ_DIR}"
-VIZ_INPUT_DIR="${SFM_DIR}"  # 預設先指向原始；若對齊成功則改用對齊後
-
-if [ "${ALIGN_SFM}" = "1" ] && [ -f "${ALIGN_SCRIPT}" ] && [ -f "${SFM_DIR}/images.bin" ]; then
-  echo "    > Aligning SfM to Z-Up with: ${ALIGN_SCRIPT}"
-  "${PY}" "${ALIGN_SCRIPT}" "${SFM_DIR}" "--out_dir=${SFM_ALIGNED}" "--dump=0" "--export-ply=0"
-  if [ -f "${SFM_ALIGNED}/images.bin" ]; then
-    echo "    > Alignment OK. Using aligned model for visualization: ${SFM_ALIGNED}"
-    VIZ_INPUT_DIR="${SFM_ALIGNED}"
-  else
-    echo "    > Alignment failed or missing output. Fallback to original: ${SFM_DIR}"
-  fi
+if [ "${ALIGN_SFM}" = "1" ] && [ "${ROOT_IMG_COUNT}" -gt 2 ]; then
+  "${PY}" "${ALIGN_SCRIPT}" "${SFM_DIR}" "--out_dir=${SFM_ALIGNED}" > "${LOG_DIR}/align.log" 2>&1
+  FINAL_SFM="${SFM_ALIGNED}"
 else
-  if [ "${ALIGN_SFM}" != "1" ]; then
-    echo "    > ALIGN_SFM=0, skip alignment. Visualize original SfM."
-  else
-    echo "    > Alignment script or model missing. Visualize original SfM."
-  fi
+  FINAL_SFM="${SFM_DIR}"
+fi
+if [ -f "${VIZ_SCRIPT}" ] && [ -d "${FINAL_SFM}" ]; then
+  "${PY}" "${VIZ_SCRIPT}" \
+    --sfm_dir "${FINAL_SFM}" \
+    --output_dir "${VIZ_DIR}" \
+    --no_server >/dev/null
 fi
 
-if [ -f "${VIZ_SCRIPT}" ]; then
-  echo "    > Exporting interactive HTML visualization..."
-  VIZ_ARGS=( --sfm_dir "${VIZ_INPUT_DIR}" --output_dir "${USE_VIZ_DIR}" )
-  if [ -f "${OUT_DIR}/poses.txt" ]; then
-    echo "      - Found poses.txt, include query cameras."
-    VIZ_ARGS+=( --query_poses "${OUT_DIR}/poses.txt" )
-  fi
-  if [ "${START_SERVER:-0}" = "1" ]; then
-    VIZ_ARGS+=( --port "${PORT:-8080}" )
-    echo "      - START_SERVER=1 (port ${PORT:-8080})"
-  else
-    VIZ_ARGS+=( --no_server )
-  fi
-  "${PY}" "${VIZ_SCRIPT}" "${VIZ_ARGS[@]}"
-  echo "    > HTML: ${USE_VIZ_DIR}/sfm_view.html"
-else
-  echo "    > Skip visualization: ${VIZ_SCRIPT} not found"
-fi
-
-echo "✅ All steps completed for Block: ${BLOCK_NAME}"
+echo "✅ Completed: ${BLOCK_NAME} (Mode: ${CAM_MODE})"
