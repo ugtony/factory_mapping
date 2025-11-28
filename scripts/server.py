@@ -128,7 +128,35 @@ class LocalizationEngine:
             # Compute Transform if anchors exist
             transform = None
             if block_dir.name in anchors:
-                transform = self._compute_sim2(recon, anchors[block_dir.name], block_dir.name)
+                anchor_cfg = anchors[block_dir.name]
+                
+                # [New] Auto-detect anchor frames if missing
+                if 'start_frame' not in anchor_cfg or 'end_frame' not in anchor_cfg:
+                    print(f"[Auto] Detecting anchor frames for {block_dir.name}...")
+                    
+                    # Sort images by name
+                    all_images = sorted([img.name for img in recon.images.values()])
+                    if not all_images:
+                        print(f"[Warn] No images in reconstruction for {block_dir.name}")
+                    else:
+                        # Prioritize _F (Front view) for 360 consistency
+                        f_images = [name for name in all_images if "_F." in name]
+                        
+                        if f_images:
+                            auto_s = f_images[0]
+                            auto_e = f_images[-1]
+                        else:
+                            auto_s = all_images[0]
+                            auto_e = all_images[-1]
+                            
+                        if 'start_frame' not in anchor_cfg:
+                            anchor_cfg['start_frame'] = auto_s
+                            print(f"    -> Auto-Start: {auto_s}")
+                        if 'end_frame' not in anchor_cfg:
+                            anchor_cfg['end_frame'] = auto_e
+                            print(f"    -> Auto-End:   {auto_e}")
+
+                transform = self._compute_sim2(recon, anchor_cfg, block_dir.name)
 
             self.blocks[block_dir.name] = {
                 'recon': recon,
