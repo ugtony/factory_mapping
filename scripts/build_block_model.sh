@@ -1,26 +1,19 @@
 #!/usr/bin/env bash
-# build_block_model.sh [V8-Configurable Global Model]
-# - Update: 支援從 project_config.env 讀取預設參數。
-# - Update: 統一參數名稱為 --global-conf。
-# - Update: 移除 USE_STAGE 參數，強制使用 Staging 模式。
-# - Fix: 使用 db.txt 白名單與實體複製 (避開 Symlink)，徹底解決 COLMAP 資料庫路徑不匹配導致的 KeyError。
+# build_block_model.sh [V10-Multi-Format]
+# - Update: 支援更多影片格式 (mp4, mov, mkv, insv, etc.)
+# - Update: 自動偵測 raw/ 目錄並呼叫 extract_frames.sh 進行抽幀。
 
 set -euo pipefail
 
 # -------- 0. 參數解析與設定檔讀取 --------
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=FLOAT] [--global-conf=STR]"
-  echo "  --mode:        std (default) or 360"
-  echo "  --dense:       (360 mode) Use 8 views instead of 4"
-  echo "  --fov:         (360 mode) Override FOV (Auto-calculated if unset)"
-  echo "  --global-conf: Global feature model (default: netvlad)"
+  echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=FLOAT] [--global-conf=STR] [--fps=FLOAT]"
   exit 1
 fi
 
 DATA_DIR="$(realpath "$1")"
 shift
 
-# --- 讀取設定檔 ---
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(realpath "${SCRIPT_DIR}/..")"
 CONFIG_FILE="${PROJECT_ROOT}/project_config.env"
@@ -30,6 +23,7 @@ DEFAULT_MODE="std"
 DEFAULT_DENSE=0
 DEFAULT_FOV="AUTO"
 DEFAULT_GLOBAL="netvlad"
+DEFAULT_FPS=2
 
 # 2. 嘗試載入設定檔
 if [ -f "${CONFIG_FILE}" ]; then
@@ -37,45 +31,30 @@ if [ -f "${CONFIG_FILE}" ]; then
   source "${CONFIG_FILE}"
 fi
 
-# 3. 套用設定檔值 (若無則使用預設值)
+# 3. 套用設定檔值
 CAM_MODE="${MODE:-$DEFAULT_MODE}"
 if [[ "${DENSE:-$DEFAULT_DENSE}" =~ ^(1|true|True)$ ]]; then DENSE_360=1; else DENSE_360=0; fi
 FOV_360="${FOV:-$DEFAULT_FOV}"
 GLOBAL_CONF="${GLOBAL_CONF:-$DEFAULT_GLOBAL}"
+EXTRACT_FPS="${FPS:-$DEFAULT_FPS}"
 
-# 4. 解析 CLI 參數 (覆寫上述設定)
+# 4. 解析 CLI 參數
 while [ $# -gt 0 ]; do
   case "$1" in
-    --mode=*) 
-      CAM_MODE="${1#*=}" 
-      ;;
-    --dense)  
-      DENSE_360=1 
-      ;;
-    --fov=*)  
-      FOV_360="${1#*=}" 
-      ;;
-    # 統一參數介面，相容多種寫法
-    --global-conf=*|--global_conf=*|--global_model=*) 
-      GLOBAL_CONF="${1#*=}" 
-      ;;
-    --global-conf|--global_conf|--global_model) 
-      GLOBAL_CONF="$2"
-      shift 
-      ;;
-    *) 
-      ;;
+    --mode=*) CAM_MODE="${1#*=}" ;;
+    --dense)  DENSE_360=1 ;;
+    --fov=*)  FOV_360="${1#*=}" ;;
+    --fps=*)  EXTRACT_FPS="${1#*=}" ;;
+    --global-conf=*|--global_conf=*|--global_model=*) GLOBAL_CONF="${1#*=}" ;;
+    --global-conf|--global_conf|--global_model) GLOBAL_CONF="$2"; shift ;;
+    *) ;;
   esac
   shift
 done
 
 # 智慧 FOV 預設值邏輯
 if [ "${CAM_MODE}" = "360" ] && [ "${FOV_360}" = "AUTO" ]; then
-  if [ "${DENSE_360}" = "1" ]; then
-    FOV_360=100.0  # 8視角
-  else
-    FOV_360=120.0  # 4視角
-  fi
+  if [ "${DENSE_360}" = "1" ]; then FOV_360=100.0; else FOV_360=120.0; fi
 fi
 
 # -------- 1. 路徑與環境設定 --------
@@ -102,10 +81,8 @@ echo "[Info] Output: ${OUT_DIR}"
 echo "========================================"
 
 # -------- 2. 組態設定 --------
-# GLOBAL_CONF 已在上方解析
 LOCAL_CONF="superpoint_aachen"
 MATCHER_CONF="superpoint+lightglue"
-
 REBUILD_SFM="${REBUILD_SFM:-0}"
 ALIGN_SFM="${ALIGN_SFM:-1}"
 NUM_RETRIEVAL="${NUM_RETRIEVAL:-10}"
@@ -120,7 +97,6 @@ PAIRS_DB_CLEAN="${OUT_DIR}/pairs-clean.txt"
 DB_MATCHES="${OUT_DIR}/db-matches-${MATCHER_CONF}.h5"
 SFM_DIR="${OUT_DIR}/sfm"
 SFM_MODELS_DIR="${SFM_DIR}/models"
-# [重要] 這是強制使用的隔離區路徑
 STAGE="${OUT_DIR}/_images_stage"
 SFM_ALIGNED="${OUT_DIR}/sfm_aligned"
 
@@ -129,13 +105,42 @@ VIZ_SCRIPT="${PROJECT_ROOT}/scripts/visualize_sfm_open3d.py"
 CONVERT_360_SCRIPT="${PROJECT_ROOT}/scripts/convert360_to_pinhole.py"
 PAIRS_360_SCRIPT="${PROJECT_ROOT}/scripts/pairs_from_360.py"
 PAIRS_STD_SCRIPT="${PROJECT_ROOT}/scripts/pairs_from_retrieval_and_sequential.py"
+EXTRACT_SCRIPT="${PROJECT_ROOT}/scripts/extract_frames.sh"
+
+# -------- [Step -1] 自動抽幀 (若有 raw/) --------
+RAW_DIR="${DATA_DIR}/raw"
+# [Update] 支援的副檔名列表 (與 extract_frames.sh 保持一致)
+VIDEO_EXTS=(-iname "*.mp4" -o -iname "*.mov" -o -iname "*.m4v" -o -iname "*.avi" -o -iname "*.mkv" -o -iname "*.flv" -o -iname "*.wmv" -o -iname "*.insv" -o -iname "*.360" -o -iname "*.mts" -o -iname "*.m2ts" -o -iname "*.webm" -o -iname "*.ts")
+
+if [ -d "${RAW_DIR}" ]; then
+  # 檢查目錄內是否有任何支援的影片檔，避免空跑
+  HAS_VIDEO=$(find "${RAW_DIR}" -maxdepth 1 -type f \( "${VIDEO_EXTS[@]}" \) -print -quit)
+  
+  if [ -n "$HAS_VIDEO" ]; then
+      echo "[-1] Found video files in raw/. Auto-extracting frames (FPS=${EXTRACT_FPS})..."
+      
+      if [ "${CAM_MODE}" = "360" ]; then
+          TARGET_EXT_DIR="${DATA_DIR}/db_360"
+      else
+          TARGET_EXT_DIR="${DATA_DIR}/db"
+      fi
+      
+      bash "${EXTRACT_SCRIPT}" "${RAW_DIR}" "${TARGET_EXT_DIR}" \
+          --fps "${EXTRACT_FPS}" \
+          --prefix "frames" \
+          --ext "jpg"
+          
+      echo "     > Extraction done. Output: ${TARGET_EXT_DIR}"
+  else
+      echo "[-1] raw/ directory exists but no supported video files found. Skipping extraction."
+  fi
+fi
 
 # -------- [Step 0] 360 前處理 --------
 if [ "${CAM_MODE}" = "360" ]; then
   echo "[0] (360 Mode) Converting Equirectangular to Pinhole..."
   SRC_360="${DATA_DIR}/db_360"
   DST_DB="${DATA_DIR}/db"
-  # 檢查來源
   if [ ! -d "${SRC_360}" ]; then echo "[Error] Missing ${SRC_360}"; exit 1; fi
   
   CONVERT_ARGS=( "--input_dir" "${SRC_360}" "--output_dir" "${DST_DB}" "--fov" "${FOV_360}" )
@@ -146,8 +151,10 @@ fi
 # -------- HLOC Pipeline --------
 echo "[1] Generating DB image list (db.txt)..."
 if [ ! -d "${DATA_DIR}/db" ]; then echo "[Error] ${DATA_DIR}/db not found."; exit 1; fi
-# 確保只列出 db 資料夾內的影像
-(cd "${DATA_DIR}" && find db -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.png' \) | sort) > "${DB_LIST}"
+
+# [Fix] 使用 maxdepth 3 以支援可能的子目錄結構
+(cd "${DATA_DIR}" && find db -maxdepth 3 -type f \( -iname '*.jpg' -o -iname '*.png' \) | sort) > "${DB_LIST}"
+
 if [ ! -s "${DB_LIST}" ]; then echo "[Error] No images in db/."; exit 1; fi
 echo "    > Found $(wc -l < "${DB_LIST}") DB images."
 
@@ -160,7 +167,7 @@ try:
     with h5py.File("${LOCAL_FEATS}","r") as f:
         for p in db_paths:
             if p not in f or "keypoints" not in f[p]:
-                print(f"[Check] Missing key '{p}'", file=sys.stderr); ok=False; break
+                ok=False; break
 except Exception: ok=False
 sys.exit(0 if ok else 1)
 PY
@@ -230,10 +237,6 @@ if [ "${REBUILD_SFM}" = "1" ]; then rm -rf "${SFM_DIR}"; fi
 if [ -f "${SFM_DIR}/images.bin" ]; then
   echo "    > SfM exists. Skipping."
 else
-  # ==============================================================================
-  # [CRITICAL FIX] 強制建立乾淨的 Staging 隔離區
-  # 作法: 依據 db.txt 白名單，使用 Hard Link 或 Copy 將圖片放入 _images_stage。
-  # ==============================================================================
   echo "    > [Fix] Staging images from db.txt to clean directory..."
   rm -rf "${STAGE}"
   mkdir -p "${STAGE}"
