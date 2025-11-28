@@ -44,7 +44,11 @@ RUN pip install --upgrade pip setuptools wheel && \
     einops \
     faiss-cpu \
     safetensors \
-    scikit-learn
+    scikit-learn \
+    fastapi \
+    uvicorn \
+    python-multipart \
+    scipy
 
 # ---- 3. 安裝 HLOC ----
 WORKDIR /opt
