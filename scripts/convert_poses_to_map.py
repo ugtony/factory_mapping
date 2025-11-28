@@ -7,9 +7,9 @@ from scipy.spatial.transform import Rotation
 import pycolmap
 import matplotlib.pyplot as plt
 
-# [New] Import shared logic
+# [Fix] 修正匯入：只匯入 map_utils 中存在的函式
 try:
-    from map_utils import compute_sim2_transform, get_data_bounds  # get_data_bounds may not be in map_utils yet
+    from map_utils import compute_sim2_transform
 except ImportError:
     from .map_utils import compute_sim2_transform
 
@@ -179,7 +179,6 @@ def main():
         try:
             sfm_path = Path(cfg['sfm_path'])
             # 這裡為了計算 Transform，需短暫載入 Recon
-            # 雖然有點重，但這是離線轉檔腳本，還可以接受
             recon = pycolmap.Reconstruction(sfm_path)
             
             # [Updated] Use modularized utility
