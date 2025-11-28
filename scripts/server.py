@@ -15,6 +15,14 @@ from scipy.spatial.transform import Rotation
 from hloc import extractors, matchers, extract_features, match_features
 from hloc.utils.base_model import dynamic_load
 
+# [New] Import shared logic
+# 確保 scripts/ 目錄在 PYTHONPATH 中，或者與此檔案同目錄
+try:
+    from map_utils import compute_sim2_transform
+except ImportError:
+    # Fallback for relative import if running as module
+    from .map_utils import compute_sim2_transform
+
 class LocalizationEngine:
     def __init__(self, project_root: Path, config_path: Path, anchors_path: Path):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -49,43 +57,6 @@ class LocalizationEngine:
         # 3. Load Database & Anchors
         self.blocks = {}
         self._load_blocks(project_root / "outputs-hloc", anchors_path)
-
-    def _compute_sim2(self, recon, anchor_cfg, block_name):
-        """Compute Sim2 transform from SfM to Map coordinates based on anchors."""
-        try:
-            def get_center(target_name):
-                # Fuzzy search for filename patterns
-                candidates = [target_name, f"db/{target_name}", f"query/{target_name}"]
-                for img in recon.images.values():
-                    if img.name in candidates or img.name.endswith(f"/{target_name}"):
-                        return img.projection_center()[:2]
-                return None
-
-            p_sfm_s = get_center(anchor_cfg['start_frame'])
-            p_sfm_e = get_center(anchor_cfg['end_frame'])
-            
-            if p_sfm_s is None or p_sfm_e is None:
-                print(f"[Warn] Anchors not found for block: {block_name}")
-                return None
-
-            p_map_s = np.array(anchor_cfg['start_map_xy'])
-            p_map_e = np.array(anchor_cfg['end_map_xy'])
-            
-            vec_sfm = p_sfm_e - p_sfm_s
-            vec_map = p_map_e - p_map_s
-            
-            # Calculate Sim2 parameters
-            s = np.linalg.norm(vec_map) / (np.linalg.norm(vec_sfm) + 1e-6)
-            theta = np.arctan2(vec_map[1], vec_map[0]) - np.arctan2(vec_sfm[1], vec_sfm[0])
-            c, si = np.cos(theta), np.sin(theta)
-            R = np.array([[c, -si], [si, c]])
-            t = p_map_s - s * (R @ p_sfm_s)
-            
-            print(f"[Init] Transform for {block_name}: Scale={s:.4f}, Rot={np.degrees(theta):.2f} deg")
-            return {'s': s, 'theta': theta, 't': t, 'R': R}
-        except Exception as e:
-            print(f"[Error] Failed to compute Sim2 for {block_name}: {e}")
-            return None
 
     def _load_blocks(self, outputs_root, anchors_path):
         anchors = {}
@@ -128,35 +99,17 @@ class LocalizationEngine:
             # Compute Transform if anchors exist
             transform = None
             if block_dir.name in anchors:
-                anchor_cfg = anchors[block_dir.name]
+                # [Updated] Use modularized utility
+                transform = compute_sim2_transform(recon, anchors[block_dir.name])
                 
-                # [New] Auto-detect anchor frames if missing
-                if 'start_frame' not in anchor_cfg or 'end_frame' not in anchor_cfg:
-                    print(f"[Auto] Detecting anchor frames for {block_dir.name}...")
-                    
-                    # Sort images by name
-                    all_images = sorted([img.name for img in recon.images.values()])
-                    if not all_images:
-                        print(f"[Warn] No images in reconstruction for {block_dir.name}")
-                    else:
-                        # Prioritize _F (Front view) for 360 consistency
-                        f_images = [name for name in all_images if "_F." in name]
-                        
-                        if f_images:
-                            auto_s = f_images[0]
-                            auto_e = f_images[-1]
-                        else:
-                            auto_s = all_images[0]
-                            auto_e = all_images[-1]
-                            
-                        if 'start_frame' not in anchor_cfg:
-                            anchor_cfg['start_frame'] = auto_s
-                            print(f"    -> Auto-Start: {auto_s}")
-                        if 'end_frame' not in anchor_cfg:
-                            anchor_cfg['end_frame'] = auto_e
-                            print(f"    -> Auto-End:   {auto_e}")
-
-                transform = self._compute_sim2(recon, anchor_cfg, block_dir.name)
+                if transform:
+                    s = transform['s']
+                    theta_deg = np.degrees(transform['theta'])
+                    f_s, f_e = transform['frames']
+                    print(f"    > Aligned via {f_s} -> {f_e}")
+                    print(f"    > Scale={s:.4f}, Rot={theta_deg:.2f}°")
+                else:
+                    print(f"[Warn] Failed to align block {block_dir.name} (anchors not found?)")
 
             self.blocks[block_dir.name] = {
                 'recon': recon,
@@ -373,9 +326,6 @@ async def localize_endpoint(
     trans = result['transform']
     
     # Compute Camera Center in SfM coordinates
-    # Note: pycolmap returns [x, y, z, w] or [w, x, y, z] depending on version, 
-    # but internal consistency is handled by Rotation.from_quat.
-    # Our debug showed that passing `q` directly works perfectly.
     R_w2c = Rotation.from_quat(q).as_matrix()
     R_c2w = R_w2c.T
     cam_center_sfm = -R_c2w @ t

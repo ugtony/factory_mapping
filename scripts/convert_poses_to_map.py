@@ -7,101 +7,37 @@ from scipy.spatial.transform import Rotation
 import pycolmap
 import matplotlib.pyplot as plt
 
-def find_auto_anchors(sfm_dir):
-    """
-    [New] 自動從 SfM 模型中尋找第一張與最後一張影像。
-    優先尋找 _F.jpg (360 模式的前視角)，若無則使用一般排序。
-    """
-    sfm_path = Path(sfm_dir)
-    if not (sfm_path / "images.bin").exists() and not (sfm_path / "images.txt").exists():
-        raise FileNotFoundError(f"SfM model not found at {sfm_dir}")
-
-    recon = pycolmap.Reconstruction(sfm_path)
-    
-    # 取得所有影像名稱並排序
-    all_images = sorted([img.name for img in recon.images.values()])
-    
-    if not all_images:
-        raise ValueError(f"No images found in reconstruction: {sfm_dir}")
-
-    # 1. 嘗試過濾出 _F (Front view) 的影像
-    f_images = [name for name in all_images if "_F." in name]
-    
-    if f_images:
-        # 360 模式：回傳 _F 的第一張與最後一張
-        return f_images[0], f_images[-1]
-    else:
-        # 一般模式：直接回傳排序後的第一張與最後一張
-        return all_images[0], all_images[-1]
-
-def get_sfm_center(sfm_dir, target_name):
-    """從 COLMAP 模型中讀取指定圖片的中心座標 (World Frame)，支援模糊比對。"""
-    sfm_path = Path(sfm_dir)
-    # 不需重複檢查路徑，pycolmap 會處理，或是由外部保證
-            
-    recon = pycolmap.Reconstruction(sfm_path)
-    
-    # 1. 精確比對
-    for img_id, img in recon.images.items():
-        if img.name == target_name:
-            c = img.projection_center()
-            return np.array([c[0], c[1]])
-            
-    # 2. 模糊比對
-    candidates = []
-    for img_id, img in recon.images.items():
-        if img.name.endswith(f"/{target_name}") or img.name == f"db/{target_name}":
-            candidates.append(img)
-            
-    if len(candidates) == 1:
-        c = candidates[0].projection_center()
-        print(f"    [Info] Fuzzy match: '{target_name}' -> '{candidates[0].name}'")
-        return np.array([c[0], c[1]])
-    elif len(candidates) > 1:
-        print(f"    [Warn] Multiple matches for '{target_name}'. Using first.")
-        c = candidates[0].projection_center()
-        return np.array([c[0], c[1]])
-            
-    sample_names = [img.name for i, img in enumerate(recon.images.values()) if i < 5]
-    raise ValueError(f"Image '{target_name}' not found in {sfm_dir}.\nSamples: {sample_names}")
-
-def compute_sim2_transform(p_sfm_s, p_sfm_e, p_map_s, p_map_e):
-    """計算 2D 相似變換 (Scale, Rotation, Translation)"""
-    vec_sfm = p_sfm_e - p_sfm_s
-    vec_map = p_map_e - p_map_s
-    
-    len_sfm = np.linalg.norm(vec_sfm)
-    len_map = np.linalg.norm(vec_map)
-    if len_sfm < 1e-6: raise ValueError("SfM anchors too close.")
-    s = len_map / len_sfm
-    
-    ang_sfm = np.arctan2(vec_sfm[1], vec_sfm[0])
-    ang_map = np.arctan2(vec_map[1], vec_map[0])
-    theta = ang_map - ang_sfm
-    
-    c, si = np.cos(theta), np.sin(theta)
-    R = np.array([[c, -si], [si, c]])
-    t = p_map_s - s * (R @ p_sfm_s)
-    
-    return s, theta, t
+# [New] Import shared logic
+try:
+    from map_utils import compute_sim2_transform, get_data_bounds  # get_data_bounds may not be in map_utils yet
+except ImportError:
+    from .map_utils import compute_sim2_transform
 
 def parse_pose(qw, qx, qy, qz, tx, ty, tz):
     """解析 Pose (World-to-Camera) -> (Center, Yaw)"""
+    # 1. 建立旋轉矩陣 (World to Camera)
     rot_w2c = Rotation.from_quat([qx, qy, qz, qw])
     R_w2c = rot_w2c.as_matrix()
     t_vec = np.array([tx, ty, tz])
     
+    # 2. 轉為 Camera to World
+    # R_c2w = R_w2c.T
     R_c2w = R_w2c.T
     center = -R_c2w @ t_vec
     
+    # 3. 計算 Yaw (基於相機正前方 +Z 軸)
     # 在 COLMAP 相機座標系中，[0, 0, 1] 是正前方
+    # 轉換到世界座標系： view_dir_world = R_c2w @ [0, 0, 1]^T
+    # 這正好是 R_c2w 的第三個 column (index 2)
     view_dir = R_c2w[:, 2] 
+    
+    # 使用 arctan2(y, x) 計算平面上的方位角
     yaw = np.degrees(np.arctan2(view_dir[1], view_dir[0]))
     
     return center, yaw
 
 def get_data_bounds(data_points, anchors_cfg):
-    """計算資料邊界與跨度"""
+    """[New] 計算資料邊界與跨度"""
     xs, ys = [], []
     
     for d in data_points:
@@ -126,11 +62,15 @@ def get_data_bounds(data_points, anchors_cfg):
     return (min_x, max_x, min_y, max_y), max_span
 
 def plot_results(output_png, data_points, anchors_cfg):
-    """繪製結果圖"""
+    """繪製結果圖 (包含 Poses, Anchors, Labels) - 動態畫布版"""
+    
+    # 1. 計算資料範圍與長寬比
     (min_x, max_x, min_y, max_y), map_span = get_data_bounds(data_points, anchors_cfg)
     
     w_range = max_x - min_x
     h_range = max_y - min_y
+    
+    # 加上 10% 的邊距 (Padding)
     pad_x = max(w_range * 0.1, 1.0)
     pad_y = max(h_range * 0.1, 1.0)
     
@@ -140,6 +80,8 @@ def plot_results(output_png, data_points, anchors_cfg):
     final_w = plot_xlim[1] - plot_xlim[0]
     final_h = plot_ylim[1] - plot_ylim[0]
     
+    # 2. 動態設定 figsize，確保畫布比例接近資料比例
+    # 設定最大邊長為 14 inch
     max_fig_size = 14
     aspect = final_w / final_h
     
@@ -150,6 +92,7 @@ def plot_results(output_png, data_points, anchors_cfg):
         fig_h = max_fig_size
         fig_w = max_fig_size * aspect
     
+    # 最小保護 (避免太扁或太窄)
     fig_w = max(fig_w, 5)
     fig_h = max(fig_h, 5)
 
@@ -159,8 +102,10 @@ def plot_results(output_png, data_points, anchors_cfg):
     plt.ylabel("Map Y")
     plt.grid(True, linestyle='--', alpha=0.6)
     
+    # 3. 設定繪圖參數
+    # 箭頭長度設為地圖最大跨度的 2%
     arrow_len = map_span * 0.02
-    if arrow_len < 0.1: arrow_len = 0.5 
+    if arrow_len < 0.1: arrow_len = 0.5 # 最小值保護
     
     anchor_size = 150
     text_offset = arrow_len * 0.6
@@ -169,6 +114,7 @@ def plot_results(output_png, data_points, anchors_cfg):
     colors = plt.cm.tab10(np.linspace(0, 1, len(unique_blocks)))
     block_color_map = {b: c for b, c in zip(unique_blocks, colors)}
 
+    # 4. 繪製相機位置
     for d in data_points:
         x, y, yaw = d['x'], d['y'], d['yaw']
         color = block_color_map.get(d['block'], 'black')
@@ -187,6 +133,7 @@ def plot_results(output_png, data_points, anchors_cfg):
         plt.text(x + text_offset, y + text_offset, f"{short_name}", 
                  fontsize=6, color=color, alpha=0.8, rotation=45)
 
+    # 5. 繪製 Anchors
     added_anchor_label = False
     for block_name, cfg in anchors_cfg.items():
         sx, sy = cfg['start_map_xy']
@@ -194,7 +141,6 @@ def plot_results(output_png, data_points, anchors_cfg):
         
         plt.scatter(sx, sy, c='red', marker='x', s=anchor_size, linewidth=2.5, 
                     label='Anchors' if not added_anchor_label else "", zorder=10)
-        # [Fix] 這裡顯示的文字可能需要根據是否為自動抓取而調整，目前維持顯示 key
         plt.text(sx, sy - text_offset, f" {block_name}_Start", color='red', fontsize=8, fontweight='bold', zorder=11, verticalalignment='top')
         
         plt.scatter(ex, ey, c='red', marker='x', s=anchor_size, linewidth=2.5, zorder=10)
@@ -203,14 +149,16 @@ def plot_results(output_png, data_points, anchors_cfg):
         plt.plot([sx, ex], [sy, ey], 'r--', alpha=0.3, linewidth=1)
         added_anchor_label = True
 
+    # 6. 設定顯示範圍與比例
     plt.xlim(plot_xlim)
     plt.ylim(plot_ylim)
-    plt.axis('equal') 
+    plt.axis('equal') # 重要：保持物理比例不變形
 
     handles, labels = plt.gca().get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
     plt.legend(by_label.values(), by_label.keys(), loc='upper left', bbox_to_anchor=(1, 1))
 
+    # 7. 儲存時裁切白邊
     plt.tight_layout()
     plt.savefig(output_png, dpi=150, bbox_inches='tight')
     print(f"🖼️  Plot saved to: {output_png}")
@@ -229,33 +177,22 @@ def main():
     
     for block_name, cfg in anchors_cfg.items():
         try:
-            sfm_path = cfg['sfm_path']
-            # [Mod] 自動偵測邏輯
-            # 如果 json 中沒有設定 start_frame 或 end_frame，則自動偵測
-            target_start = cfg.get('start_frame')
-            target_end = cfg.get('end_frame')
-
-            if not target_start or not target_end:
-                print(f"  [Auto] Detecting anchor frames for {block_name}...")
-                auto_s, auto_e = find_auto_anchors(sfm_path)
+            sfm_path = Path(cfg['sfm_path'])
+            # 這裡為了計算 Transform，需短暫載入 Recon
+            # 雖然有點重，但這是離線轉檔腳本，還可以接受
+            recon = pycolmap.Reconstruction(sfm_path)
+            
+            # [Updated] Use modularized utility
+            trans = compute_sim2_transform(recon, cfg)
+            
+            if trans:
+                transforms[block_name] = trans
+                s = trans['s']
+                theta = trans['theta']
+                print(f"  > {block_name}: Scale={s:.4f}, Rot={np.degrees(theta):.2f}°")
+            else:
+                print(f"  [Warn] Could not compute transform for {block_name}")
                 
-                if not target_start:
-                    target_start = auto_s
-                    print(f"    -> Auto-Start: {target_start}")
-                if not target_end:
-                    target_end = auto_e
-                    print(f"    -> Auto-End:   {target_end}")
-            
-            # 使用確認後的 frame name
-            p_sfm_s = get_sfm_center(sfm_path, target_start)
-            p_sfm_e = get_sfm_center(sfm_path, target_end)
-            
-            p_map_s = np.array(cfg['start_map_xy'])
-            p_map_e = np.array(cfg['end_map_xy'])
-            
-            s, theta, t = compute_sim2_transform(p_sfm_s, p_sfm_e, p_map_s, p_map_e)
-            transforms[block_name] = (s, theta, t)
-            print(f"  > {block_name}: Scale={s:.4f}, Rot={np.degrees(theta):.2f}°")
         except Exception as e:
             print(f"  [Error] {block_name} failed: {e}")
 
@@ -290,7 +227,8 @@ def main():
             if block_name not in transforms: continue
             
             sfm_center, sfm_yaw = parse_pose(*vals)
-            s, theta, t_vec = transforms[block_name]
+            t_data = transforms[block_name]
+            s, theta, t_vec = t_data['s'], t_data['theta'], t_data['t']
             
             c, si = np.cos(theta), np.sin(theta)
             R_mat = np.array([[c, -si], [si, c]])
