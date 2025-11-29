@@ -1,4 +1,3 @@
-# scripts/run_localization.py
 #!/usr/bin/env python3
 import argparse
 import sys
@@ -6,6 +5,7 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from pathlib import Path
+from collections import Counter
 
 # [Plan A] Setup path to find 'lib'
 current_dir = Path(__file__).resolve().parent
@@ -13,6 +13,11 @@ project_root = current_dir.parent
 sys.path.append(str(project_root))
 
 from lib.localization_engine import LocalizationEngine
+# [New] Import 3D visualization tool
+try:
+    from scripts import visualize_sfm_open3d
+except ImportError:
+    import visualize_sfm_open3d
 
 def draw_matches(query_img, db_img_path, kpts_q, kpts_db, matches, out_path):
     try:
@@ -48,7 +53,7 @@ def main():
     parser.add_argument("--reference", type=Path, help="Path to hloc outputs root")
     parser.add_argument("--fov", type=float, default=None)
     parser.add_argument("--output", type=Path, default="offline_results.txt")
-    parser.add_argument("--viz", action="store_true")
+    parser.add_argument("--viz", action="store_true", help="Visualize both 2D matches and 3D point cloud")
     args = parser.parse_args()
 
     engine = LocalizationEngine(
@@ -61,11 +66,18 @@ def main():
     fov = args.fov if args.fov else engine.default_fov
     print(f"=== Starting Offline Localization (FOV={fov}) ===")
     query_files = sorted([p for p in args.query_dir.glob("**/*") if p.suffix.lower() in {'.jpg','.png','.jpeg'}])
-    viz_dir = args.query_dir.parent / "viz_offline"
-    if args.viz: viz_dir.mkdir(exist_ok=True, parents=True)
+    
+    # Setup Viz Directories
+    viz_dir_2d = args.query_dir.parent / "viz_offline"
+    viz_dir_3d = args.query_dir.parent / "viz_3d"
+    if args.viz: 
+        viz_dir_2d.mkdir(exist_ok=True, parents=True)
+        # viz_dir_3d will be created by visualize_sfm_open3d
 
     results_lines = []
+    success_blocks = [] # Track which blocks were matched
     success_count = 0
+    
     for q_path in query_files:
         print(f"Processing {q_path.name}...", end=" ", flush=True)
         img = cv2.imread(str(q_path))
@@ -77,17 +89,53 @@ def main():
         if ret['success']:
             print(f"✅ Block: {ret['block']} ({ret['inliers']} inliers)")
             success_count += 1
+            success_blocks.append(ret['block'])
+            
             qvec, tvec = ret['pose']['qvec'], ret['pose']['tvec']
             line = f"{q_path.name} {qvec[0]} {qvec[1]} {qvec[2]} {qvec[3]} {tvec[0]} {tvec[1]} {tvec[2]} {ret['block']}"
             results_lines.append(line)
+            
+            # [Viz 1/2] 2D Matches
             if args.viz and 'matches' in ret:
-                draw_matches(img, ret['db_image_path'], ret['kpts_query'], ret['kpts_db'], ret['matches'], viz_dir / f"{q_path.stem}_matches.jpg")
+                draw_matches(img, ret['db_image_path'], ret['kpts_query'], ret['kpts_db'], ret['matches'], viz_dir_2d / f"{q_path.stem}_matches.jpg")
         else: print("❌ Failed")
 
     with open(args.output, 'w') as f:
         f.write("# ImageName Qw Qx Qy Qz Tx Ty Tz BlockName\n")
         for line in results_lines: f.write(line + "\n")
     print(f"\nSummary: {success_count}/{len(query_files)} localized.")
+    print(f"Results saved to: {args.output}")
+
+    # [Viz 2/2] 3D Point Cloud (Batch Generation)
+    if args.viz and success_count > 0:
+        print("\n=== Generating 3D Visualizations ===")
+        
+        # 取得所有成功定位的 Block (去重)
+        unique_blocks = set(success_blocks)
+        
+        for block_name in unique_blocks:
+            print(f"[Viz] Processing Block: {block_name}...")
+            
+            # 決定 SfM 路徑
+            ref_root = args.reference if args.reference else (project_root / "outputs-hloc")
+            sfm_path = ref_root / block_name / "sfm_aligned"
+            if not (sfm_path / "images.bin").exists():
+                 sfm_path = ref_root / block_name / "sfm"
+            
+            # 為每個 Block 建立獨立的輸出資料夾
+            block_viz_dir = viz_dir_3d / block_name
+            block_viz_dir.mkdir(parents=True, exist_ok=True)
+            
+            try:
+                visualize_sfm_open3d.main(
+                    sfm_dir=str(sfm_path),
+                    output_dir=str(block_viz_dir),
+                    query_poses=str(args.output),
+                    no_server=True,  # [Fix] 強制不跳出視窗
+                    target_block=block_name # [Fix] 指定 Block 名稱進行過濾
+                )
+            except Exception as e:
+                print(f"[Viz] Failed for {block_name}: {e}")
 
 if __name__ == "__main__":
     main()
