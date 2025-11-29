@@ -16,7 +16,7 @@ from hloc.utils.base_model import dynamic_load
 try:
     from .map_utils import compute_sim2_transform
 except ImportError:
-    # Fallback if executed as script (should not happen in Plan A)
+    # Fallback if executed as script
     from map_utils import compute_sim2_transform
 
 class LocalizationEngine:
@@ -33,7 +33,11 @@ class LocalizationEngine:
                         self.config[k.strip()] = v.strip().strip('"').strip("'")
         
         self.global_conf_name = self.config.get("GLOBAL_CONF", "netvlad")
-        self.default_fov = float(self.config.get("FOV", 69.4))
+        
+        # [Modify] 優先讀取 FOV_QUERY，若無則讀取舊版 FOV，最後預設 70.0
+        self.default_fov = float(self.config.get("FOV_QUERY", self.config.get("FOV", 70.0)))
+        print(f"[Init] Default Query FOV: {self.default_fov}")
+
         self.project_root = project_root
         
         print("[Init] Loading Neural Network Models...")

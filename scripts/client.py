@@ -3,8 +3,8 @@ import json
 
 # 設定測試參數 (對齊 offline 的設定)
 url = "http://localhost:8000/localize"
-img_path = "data/brazil360/query/frames-000021_F.jpg"
-fov = 100
+img_path = "data/brazil360/query/frames-000021_F.jpg" # 請確認您的測試圖片路徑
+fov = 70  # 改為手機常用的 70 度
 
 print(f"Testing image: {img_path} (FOV={fov})")
 
@@ -26,7 +26,7 @@ try:
         # 驗證重點
         print("\n=== Verification ===")
         print(f"Block:   {res.get('block')} (Expected: brazil360)")
-        print(f"Inliers: {res.get('inliers')} (Expected: ~694)")
+        print(f"Inliers: {res.get('inliers')}")
     else:
         print(f"Error: {resp.status_code} - {resp.text}")
 

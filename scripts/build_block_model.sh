@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# build_block_model.sh [V10-Multi-Format]
+# build_block_model.sh [V10-Multi-Format-FOV-Split]
 # - Update: 支援更多影片格式 (mp4, mov, mkv, insv, etc.)
 # - Update: 自動偵測 raw/ 目錄並呼叫 extract_frames.sh 進行抽幀。
+# - Update: 使用 FOV_MODEL 作為建模視角
 
 set -euo pipefail
 
@@ -31,10 +32,13 @@ if [ -f "${CONFIG_FILE}" ]; then
   source "${CONFIG_FILE}"
 fi
 
-# 3. 套用設定檔值
+# 3. 套用設定檔值 (改用 FOV_MODEL)
 CAM_MODE="${MODE:-$DEFAULT_MODE}"
 if [[ "${DENSE:-$DEFAULT_DENSE}" =~ ^(1|true|True)$ ]]; then DENSE_360=1; else DENSE_360=0; fi
-FOV_360="${FOV:-$DEFAULT_FOV}"
+
+# 優先使用 FOV_MODEL，若無則為 AUTO
+FOV_MODEL_VAL="${FOV_MODEL:-$DEFAULT_FOV}"
+
 GLOBAL_CONF="${GLOBAL_CONF:-$DEFAULT_GLOBAL}"
 EXTRACT_FPS="${FPS:-$DEFAULT_FPS}"
 
@@ -43,7 +47,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --mode=*) CAM_MODE="${1#*=}" ;;
     --dense)  DENSE_360=1 ;;
-    --fov=*)  FOV_360="${1#*=}" ;;
+    --fov=*)  FOV_MODEL_VAL="${1#*=}" ;; # 允許 CLI 覆蓋 FOV
     --fps=*)  EXTRACT_FPS="${1#*=}" ;;
     --global-conf=*|--global_conf=*|--global_model=*) GLOBAL_CONF="${1#*=}" ;;
     --global-conf|--global_conf|--global_model) GLOBAL_CONF="$2"; shift ;;
@@ -53,8 +57,8 @@ while [ $# -gt 0 ]; do
 done
 
 # 智慧 FOV 預設值邏輯
-if [ "${CAM_MODE}" = "360" ] && [ "${FOV_360}" = "AUTO" ]; then
-  if [ "${DENSE_360}" = "1" ]; then FOV_360=100.0; else FOV_360=120.0; fi
+if [ "${CAM_MODE}" = "360" ] && [ "${FOV_MODEL_VAL}" = "AUTO" ]; then
+  if [ "${DENSE_360}" = "1" ]; then FOV_MODEL_VAL=100.0; else FOV_MODEL_VAL=120.0; fi
 fi
 
 # -------- 1. 路徑與環境設定 --------
@@ -75,7 +79,7 @@ echo "[Info] Mode: ${CAM_MODE^^}"
 echo "[Info] Global Model: ${GLOBAL_CONF}"
 if [ "${CAM_MODE}" = "360" ]; then
   [ "${DENSE_360}" = "1" ] && V_TYPE="Dense(8)" || V_TYPE="Sparse(4)"
-  echo "[Info] 360 Settings: ${V_TYPE}, FOV=${FOV_360}"
+  echo "[Info] 360 Settings: ${V_TYPE}, Modeling FOV=${FOV_MODEL_VAL}"
 fi
 echo "[Info] Output: ${OUT_DIR}"
 echo "========================================"
@@ -109,11 +113,9 @@ EXTRACT_SCRIPT="${PROJECT_ROOT}/scripts/extract_frames.sh"
 
 # -------- [Step -1] 自動抽幀 (若有 raw/) --------
 RAW_DIR="${DATA_DIR}/raw"
-# [Update] 支援的副檔名列表 (與 extract_frames.sh 保持一致)
 VIDEO_EXTS=(-iname "*.mp4" -o -iname "*.mov" -o -iname "*.m4v" -o -iname "*.avi" -o -iname "*.mkv" -o -iname "*.flv" -o -iname "*.wmv" -o -iname "*.insv" -o -iname "*.360" -o -iname "*.mts" -o -iname "*.m2ts" -o -iname "*.webm" -o -iname "*.ts")
 
 if [ -d "${RAW_DIR}" ]; then
-  # 檢查目錄內是否有任何支援的影片檔，避免空跑
   HAS_VIDEO=$(find "${RAW_DIR}" -maxdepth 1 -type f \( "${VIDEO_EXTS[@]}" \) -print -quit)
   
   if [ -n "$HAS_VIDEO" ]; then
@@ -143,7 +145,7 @@ if [ "${CAM_MODE}" = "360" ]; then
   DST_DB="${DATA_DIR}/db"
   if [ ! -d "${SRC_360}" ]; then echo "[Error] Missing ${SRC_360}"; exit 1; fi
   
-  CONVERT_ARGS=( "--input_dir" "${SRC_360}" "--output_dir" "${DST_DB}" "--fov" "${FOV_360}" )
+  CONVERT_ARGS=( "--input_dir" "${SRC_360}" "--output_dir" "${DST_DB}" "--fov" "${FOV_MODEL_VAL}" )
   if [ "${DENSE_360}" = "1" ]; then CONVERT_ARGS+=( "--dense" ); fi
   "${PY}" "${CONVERT_360_SCRIPT}" "${CONVERT_ARGS[@]}"
 fi
@@ -152,7 +154,6 @@ fi
 echo "[1] Generating DB image list (db.txt)..."
 if [ ! -d "${DATA_DIR}/db" ]; then echo "[Error] ${DATA_DIR}/db not found."; exit 1; fi
 
-# [Fix] 使用 maxdepth 3 以支援可能的子目錄結構
 (cd "${DATA_DIR}" && find db -maxdepth 3 -type f \( -iname '*.jpg' -o -iname '*.png' \) | sort) > "${DB_LIST}"
 
 if [ ! -s "${DB_LIST}" ]; then echo "[Error] No images in db/."; exit 1; fi
@@ -186,9 +187,9 @@ echo "[5] Building DB pairs..."
 if [ "${CAM_MODE}" = "360" ]; then
   echo "    > [360 Mode] Using explicit geometric pairing..."
   PAIRS_ARGS=( "--db_list" "${DB_LIST}" "--output" "${PAIRS_DB}" "--seq_window" "${SEQ_WINDOW}" )
-  IS_FOV_GT_90=$(awk -v f="${FOV_360}" 'BEGIN {print (f > 90 ? 1 : 0)}')
+  IS_FOV_GT_90=$(awk -v f="${FOV_MODEL_VAL}" 'BEGIN {print (f > 90 ? 1 : 0)}')
   if [ "${IS_FOV_GT_90}" -eq 1 ]; then
-      echo "      - FOV > 90 (${FOV_360}), enabling intra-frame matching."
+      echo "      - FOV > 90 (${FOV_MODEL_VAL}), enabling intra-frame matching."
       PAIRS_ARGS+=( "--intra_match" )
   fi
   "${PY}" "${PAIRS_360_SCRIPT}" "${PAIRS_ARGS[@]}"

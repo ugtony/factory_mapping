@@ -57,12 +57,13 @@ for block_dir in "${PARENT_DIR}"/*; do
         echo "----------------------------------------------------------------"
         
         if bash "${BUILD_SCRIPT}" "${block_dir}" "$@"; then
-            ((success_count++))
+            # [Fix] 改用 +=1 避免 ((0++)) 回傳 status 1 觸發 set -e 導致腳本中斷
+            ((success_count+=1))
         else
             echo "[Batch] [Error] Build failed for ${block_name}"
-            ((fail_count++))
+            ((fail_count+=1))
         fi
-        ((count++))
+        ((count+=1))
     fi
 done
 

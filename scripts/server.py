@@ -1,6 +1,7 @@
 # scripts/server.py
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from typing import Optional
 from pydantic import BaseModel
 import numpy as np
 import cv2
@@ -39,7 +40,7 @@ class LocalizeResponse(BaseModel):
     latency_ms: float = 0.0
 
 @app.post("/localize", response_model=LocalizeResponse)
-async def localize_endpoint(file: UploadFile = File(...), fov: float = Form(100.0)):
+async def localize_endpoint(file: UploadFile = File(...), fov: Optional[float] = Form(None)):
     t0 = time.time()
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
@@ -47,6 +48,7 @@ async def localize_endpoint(file: UploadFile = File(...), fov: float = Form(100.
     if img is None: raise HTTPException(status_code=400, detail="Invalid image")
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
+    # 傳入 None 讓 engine 使用設定檔中的 FOV_QUERY
     result = engine.localize(img, fov_deg=fov, return_details=False)
     dt = (time.time() - t0) * 1000
     
