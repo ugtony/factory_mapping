@@ -1,4 +1,3 @@
-# scripts/convert_poses_to_map.py
 #!/usr/bin/env python3
 import argparse
 import json
@@ -14,12 +13,21 @@ current_dir = Path(__file__).resolve().parent
 project_root = current_dir.parent
 sys.path.append(str(project_root))
 
-from lib.map_utils import compute_sim2_transform
+# [新增] 引入標準轉換函式
+from lib.map_utils import compute_sim2_transform, colmap_to_scipy_quat
 
-def parse_pose(qw, qx, qy, qz, tx, ty, tz):
-    rot_w2c = Rotation.from_quat([qx, qy, qz, qw])
+def parse_pose(qvec, tvec):
+    """
+    解析姿態。
+    qvec: COLMAP 格式 [w, x, y, z]
+    tvec: [tx, ty, tz]
+    """
+    # 使用標準函式轉換，不要依賴參數順序解包
+    q_scipy = colmap_to_scipy_quat(qvec)
+    
+    rot_w2c = Rotation.from_quat(q_scipy)
     R_w2c = rot_w2c.as_matrix()
-    t_vec = np.array([tx, ty, tz])
+    t_vec = np.array(tvec)
     R_c2w = R_w2c.T
     center = -R_c2w @ t_vec
     view_dir = R_c2w[:, 2]
@@ -117,18 +125,23 @@ def main():
             parts = line.split()
             if len(parts) < 8: continue
             try:
-                name = parts[0]; vals = list(map(float, parts[1:8]))
+                name = parts[0]
+                # 明確讀取為列表，不要用 *vals 解包
+                qvec = list(map(float, parts[1:5])) # w, x, y, z
+                tvec = list(map(float, parts[5:8])) # tx, ty, tz
                 block_name = parts[8] if len(parts) >= 9 else list(transforms.keys())[0]
             except ValueError: continue
             if block_name not in transforms: continue
             
-            sfm_center, sfm_yaw = parse_pose(*vals)
+            # 傳入 qvec 與 tvec 列表
+            sfm_center, sfm_yaw = parse_pose(qvec, tvec)
+            
             t_data = transforms[block_name]
-            s, theta, t_vec = t_data['s'], t_data['theta'], t_data['t']
+            s, theta, t_vec_map = t_data['s'], t_data['theta'], t_data['t']
             
             c, si = np.cos(theta), np.sin(theta)
             R_mat = np.array([[c, -si], [si, c]])
-            p_map = s * (R_mat @ sfm_center[:2]) + t_vec
+            p_map = s * (R_mat @ sfm_center[:2]) + t_vec_map
             map_yaw = (sfm_yaw + np.degrees(theta) + 180) % 360 - 180
             
             f_out.write(f"{name}, {p_map[0]:.4f}, {p_map[1]:.4f}, {map_yaw:.4f}, {block_name}\n")

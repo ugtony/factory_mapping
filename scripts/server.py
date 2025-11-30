@@ -16,6 +16,7 @@ project_root = current_dir.parent
 sys.path.append(str(project_root))
 
 from lib.localization_engine import LocalizationEngine
+from lib.map_utils import colmap_to_scipy_quat
 
 app = FastAPI(title="Visual Localization Service")
 engine: LocalizationEngine = None
@@ -48,7 +49,9 @@ async def localize_endpoint(file: UploadFile = File(...), fov: Optional[float] =
     if img is None: raise HTTPException(status_code=400, detail="Invalid image")
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    # 傳入 None 讓 engine 使用設定檔中的 FOV_QUERY
+    # 實際使用的 FOV
+    actual_fov = fov if fov is not None else engine.default_fov
+
     result = engine.localize(img, fov_deg=fov, return_details=False)
     dt = (time.time() - t0) * 1000
     
@@ -58,7 +61,10 @@ async def localize_endpoint(file: UploadFile = File(...), fov: Optional[float] =
     q, t = result['pose']['qvec'], result['pose']['tvec']
     trans = result['transform']
     
-    R_w2c = Rotation.from_quat(q).as_matrix()
+    # [Fix] 使用標準函式進行四元數轉換，修正順序錯誤
+    q_scipy = colmap_to_scipy_quat(q)
+    
+    R_w2c = Rotation.from_quat(q_scipy).as_matrix()
     R_c2w = R_w2c.T
     cam_center_sfm = -R_c2w @ t
     view_dir = R_c2w[:, 2]

@@ -92,22 +92,23 @@
 --------------------------------------------------------------------------------
 [問題]: 數學庫之間的定義不同，導致座標轉換後位置全錯。
 
-* Eigen / PyColmap 內部:
-  - 順序: [x, y, z, w] (Imaginary first)
-  - 特徵: 實部 w 在最後。
-
-* COLMAP 檔案 / HLOC / Scipy:
+* COLMAP 檔案 / HLOC / pycolmap:
   - 順序: [w, x, y, z] (Real first)
-  - 特徵: 實部 w 在最前。
+  
+* Scipy (scipy.spatial.transform.Rotation):
+  - 順序: [x, y, z, w] (Real last)
 
-[判斷法]:
-  通常 w 是最大的值 (接近 1 或 0.5 以上)。
-  如果你的結果是 [0.01, 0.02, 0.01, 0.99]，那 0.99 肯定就是 w。
-  這代表它是 [x, y, z, w] 格式。
+[嚴重性]:
+  如果直接將 COLMAP 的 qvec 丟給 Scipy，旋轉矩陣會完全錯誤，導致定位點飛到地圖外。
 
 [正確操作]:
-  從 pycolmap 拿到 q (x,y,z,w) 後，必須手動轉為 (w,x,y,z) 才能存入 results.txt 或傳給 Scipy 計算。
-  q_final = [q[3], q[0], q[1], q[2]]
+  ❌ 不要手動交換索引 (如 `[q[1], q[2], q[3], q[0]]`)，容易寫錯。
+  ✅ 請使用 `lib.map_utils.colmap_to_scipy_quat(qvec)` 標準函式進行轉換。
+  
+  ```python
+  from lib.map_utils import colmap_to_scipy_quat
+  q_scipy = colmap_to_scipy_quat(q_colmap)
+  R = Rotation.from_quat(q_scipy).as_matrix()
 
 --------------------------------------------------------------------------------
 6. 影像縮放 (Resize) 與座標還原
@@ -124,4 +125,15 @@
   kpt_orig_x = (kpt_new_x + 0.5) * scale_x - 0.5
   (加上 0.5 是為了對齊 Pixel Center 定義)
 
+--------------------------------------------------------------------------------
+Bash 腳本的 set -e 與計數器陷阱
+--------------------------------------------------------------------------------
+
+[問題]: 批次腳本 (Batch Script) 在處理完第一個資料夾後就莫名終止。
+
+[原因]: 當使用 set -e (Exit on error) 時，Bash 若遇到回傳值非 0 的指令會立刻停止。 指令 ((count++)) 若 count 初始為 0，運算結果為 0，這在 Bash 算術中被視為 "False/Error" (Status 1)。
+
+[解決方案]: ❌ 不要用 ((count++)) ✅ 改用 ((count+=1)) 或 ((++count)) (前置遞增，回傳值為 1，Status 0)
+
 ================================================================================
+

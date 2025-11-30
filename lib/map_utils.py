@@ -3,6 +3,14 @@ import numpy as np
 import pycolmap
 from pathlib import Path
 
+def colmap_to_scipy_quat(qvec_colmap):
+    """
+    [新增] 將 COLMAP 格式四元數 [w, x, y, z] 轉換為 Scipy 格式 [x, y, z, w]。
+    統一使用此函式，避免手動交換索引時出錯。
+    """
+    w, x, y, z = qvec_colmap
+    return np.array([x, y, z, w])
+
 def get_sfm_center(recon: pycolmap.Reconstruction, target_name: str):
     for img in recon.images.values():
         if img.name == target_name:
