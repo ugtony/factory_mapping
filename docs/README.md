@@ -1,7 +1,7 @@
-# 🏭 Factory Indoor Localization & Mapping System
+# 🏭 Indoor Localization & Mapping System
 
-本專案是一套針對大型室內工廠環境設計的影像式定位系統（Visual Localization）。
-基於 **HLOC (Hierarchical Localization)** 框架，並針對工廠環境的特殊性（相似場景多、360 全景影像、多區域管理）進行了深度優化與架構重構。
+本專案是一套針對大型室內環境設計的影像式定位系統（Visual Localization）。
+基於 **HLOC (Hierarchical Localization)** 框架，並針對室內環境的特殊性（相似場景多、360 全景影像、多區域管理）進行了深度優化與架構重構。
 
 ---
 
@@ -30,7 +30,7 @@
 ## 📁 建議資料夾結構
 
 ```plaintext
-/factory_mapping_project/
+/indoor_mapping_project/
 │
 ├── project_config.env          # [Config] 全域設定檔 (FOV, Global Model 等)
 │
@@ -115,7 +115,7 @@ python scripts/server.py
 python scripts/client.py
 
 ### Step 5. 座標轉換 (Map Conversion)
-將定位輸出的 6DoF 姿態轉換到工廠平面圖座標 (需準備 anchors.json)。
+將定位輸出的 6DoF 姿態轉換到室內平面圖座標 (需準備 anchors.json)。
 
 python scripts/convert_poses_to_map.py \
   --submission offline_results.txt \
