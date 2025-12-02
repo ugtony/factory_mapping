@@ -33,9 +33,117 @@ class LocalizationEngine:
                         self.config[k.strip()] = v.strip().strip('"').strip("'")
         
         self.global_conf_name = self.config.get("GLOBAL_CONF", "netvlad")
-        
-        # [Modify] 優先讀取 FOV_QUERY，若無則讀取舊版 FOV，最後預設 70.0
         self.default_fov = float(self.config.get("FOV_QUERY", self.config.get("FOV", 70.0)))
+        print(f"[Init] Default Query FOV: {self.default_fov}")
+
+        self.project_root = project_root
+        
+        print("[Init] Loading Neural Network Models...")
+        local_conf = extract_features.confs['superpoint_aachen']
+        ModelLocal = dynamic_load(extractors, local_conf['model']['name'])
+        self.model_extract_local = ModelLocal(local_conf['model']).eval().to(self.device)
+        
+        global_conf = extract_features.confs[self.global_conf_name]
+        ModelGlobal = dynamic_load(extractors, global_conf['model']['name'])
+        self.model_extract_global = ModelGlobal(global_conf['model']).eval().to(self.device)
+        
+        matcher_conf = match_features.confs['superpoint+lightglue']
+        ModelMatcher = dynamic_load(matchers, matcher_conf['model']['name'])
+        self.model_matcher = ModelMatcher(matcher_conf['model']).eval().to(self.device)
+        
+        target_outputs = outputs_dir if outputs_dir else (project_root / "outputs-hloc")
+        self.blocks = {}
+        self._load_blocks(target_outputs, anchors_path)
+
+    def _load_blocks(self, outputs_root, anchors_path):
+        anchors = {}
+        if anchors_path.exists():
+            with open(anchors_path, 'r') as f: anchors = json.load(f)
+
+        for block_dir in outputs_root.iterdir():
+            if not block_dir.is_dir(): continue
+            sfm_dir = block_dir / "sfm_aligned"
+            if not (sfm_dir / "images.bin").exists(): sfm_dir = block_dir / "sfm"
+            global_h5 = block_dir / f"global-{self.global_conf_name}.h5"
+            local_h5_path = block_dir / "local-superpoint_aachen.h5"
+            
+            if not (sfm_dir/"images.bin").exists() or not global_h5.exists() or not local_h5_path.exists():
+                continue
+
+            print(f"[Init] Loading Block: {block_dir.name}")
+            g_names = []
+            g_vecs = []
+            with h5py.File(global_h5, 'r') as f:
+                def visit(name, obj):
+                    if isinstance(obj, h5py.Group) and 'global_descriptor' in obj:
+                        g_names.append(name)
+                        g_vecs.append(obj['global_descriptor'].__array__())
+                f.visititems(visit)
+            
+            if not g_vecs: continue
+            g_vecs = torch.from_numpy(np.array(g_vecs)).to(self.device).squeeze()
+            if g_vecs.ndim == 1: g_vecs = g_vecs.unsqueeze(0)
+
+            try:
+                recon = pycolmap.Reconstruction(sfm_dir)
+                name_to_id = {img.name: img_id for img_id, img in recon.images.items()}
+            except Exception as e:
+                print(f"    [Error] Failed to load SfM: {e}"); continue
+            
+            transform = None
+            if block_dir.name in anchors:
+                try:
+                    transform = compute_sim2_transform(recon, anchors[block_dir.name])
+                except: pass
+
+            self.blocks[block_dir.name] = {
+                'recon': recon,
+                'name_to_id': name_to_id,
+                'global_names': g_names,
+                'global_vecs': g_vecs,
+                'local_h5_path': local_h5_path,
+                'local_h5': h5py.File(local_h5_path, 'r'),
+                'transform': transform,
+                'block_root': block_dir
+            }
+
+    # lib/localization_engine.py
+import numpy as np
+import cv2
+import torch
+import h5py
+import pycolmap
+import json
+from pathlib import Path
+from scipy.spatial.transform import Rotation
+
+# HLOC Imports
+from hloc import extractors, matchers, extract_features, match_features
+from hloc.utils.base_model import dynamic_load
+
+# [Clean Import] Relative import within the package
+try:
+    from .map_utils import compute_sim2_transform
+except ImportError:
+    # Fallback if executed as script
+    from map_utils import compute_sim2_transform
+
+class LocalizationEngine:
+    def __init__(self, project_root: Path, config_path: Path, anchors_path: Path, outputs_dir: Path = None, device: str = None):
+        self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"[Init] LocalizationEngine using device: {self.device}")
+        
+        self.config = {}
+        if config_path.exists():
+            with open(config_path) as f:
+                for line in f:
+                    if '=' in line and not line.startswith('#'):
+                        k, v = line.strip().split('=', 1)
+                        self.config[k.strip()] = v.strip().strip('"').strip("'")
+        
+        self.global_conf_name = self.config.get("GLOBAL_CONF", "netvlad")
+        # [Align] Default FOV 調整為 69.4 以對齊 HLOC 預設值
+        self.default_fov = float(self.config.get("FOV_QUERY", self.config.get("FOV", 69.4)))
         print(f"[Init] Default Query FOV: {self.default_fov}")
 
         self.project_root = project_root
@@ -118,7 +226,10 @@ class LocalizationEngine:
     def localize(self, image_arr: np.ndarray, fov_deg: float = None, return_details: bool = False, top_k_db: int = 10):
         if fov_deg is None: fov_deg = self.default_fov
         
+        # 1. Image Preprocessing
         h_orig, w_orig = image_arr.shape[:2]
+        print(f"\n[DEBUG] Input Image Size: {w_orig}x{h_orig}")
+        
         resize_max = 1024
         scale = 1.0
         new_w, new_h = w_orig, h_orig
@@ -132,14 +243,21 @@ class LocalizationEngine:
 
         scale_x = w_orig / new_w
         scale_y = h_orig / new_h
+        print(f"[DEBUG] Resized to: {new_w}x{new_h} (Scale X: {scale_x:.4f}, Y: {scale_y:.4f})")
 
         img_t = torch.from_numpy(image_tensor.transpose(2, 0, 1)).float().div(255.).unsqueeze(0).to(self.device)
         img_g = torch.from_numpy(cv2.cvtColor(image_tensor, cv2.COLOR_RGB2GRAY)).float().div(255.).unsqueeze(0).unsqueeze(0).to(self.device)
 
+        # 2. Global Feature
         q_global = self.model_extract_global({'image': img_t})['global_descriptor']
+        g_sum = torch.sum(q_global).item()
+        print(f"[DEBUG] Global Desc Sum: {g_sum:.6f}")
+
+        # 3. Local Feature
         q_local = self.model_extract_local({'image': img_g})
         kpts = q_local['keypoints'][0]
         desc = q_local['descriptors'][0]
+        print(f"[DEBUG] Raw Keypoints Count: {len(kpts)}")
         
         # Coordinate Restoration
         kpts[:, 0] = (kpts[:, 0] + 0.5) * scale_x - 0.5
@@ -152,15 +270,29 @@ class LocalizationEngine:
             params=np.array([f, w_orig/2.0, h_orig/2.0], dtype=np.float64)
         )
 
-        best_result = None
         candidate_blocks = []
+        
+        # [Consistency 1] Scoring Logic: Top-5 Mean
         for name, block in self.blocks.items():
-            sim = torch.matmul(q_global, block['global_vecs'].t())
-            score, _ = torch.max(sim, dim=1)
+            sim = torch.matmul(q_global, block['global_vecs'].t()) # (1, N_db)
+            
+            k_scoring = min(5, sim.shape[1])
+            if k_scoring > 0:
+                topk_vals, _ = torch.topk(sim, k=k_scoring, dim=1)
+                score = torch.mean(topk_vals, dim=1)
+            else:
+                score = torch.tensor([0.0], device=self.device)
+
             if score.item() > 0.01: candidate_blocks.append((score.item(), name, sim))
         
         candidate_blocks.sort(key=lambda x: x[0], reverse=True)
         
+        if candidate_blocks:
+            print(f"[DEBUG] Top Block: {candidate_blocks[0][1]} (Score: {candidate_blocks[0][0]:.4f})")
+        
+        # [Consistency 2] Best Block Selection: 收集所有結果，取 Inliers 最大者
+        valid_block_results = []
+
         for _, block_name, sim_matrix in candidate_blocks:
             block = self.blocks[block_name]
             k_val = min(top_k_db, sim_matrix.shape[1])
@@ -170,9 +302,17 @@ class LocalizationEngine:
             p2d_list, p3d_list = [], []
             viz_details = {}
             
+            # [Consistency 3] De-duplication: Track matched Query Keypoints
+            seen_queries = set()
+            
+            print(f"[DEBUG] --- Checking Block: {block_name} ---")
+            
             for rank, db_idx in enumerate(indices):
                 db_name = block['global_names'][db_idx]
                 if db_name not in block['local_h5'] or db_name not in block['name_to_id']: continue
+                
+                if rank == 0:
+                    print(f"[DEBUG] Rank 0 DB Image: {db_name}")
                 
                 img_obj = block['recon'].images[block['name_to_id'][db_name]]
                 cam_db = block['recon'].cameras[img_obj.camera_id]
@@ -190,6 +330,10 @@ class LocalizationEngine:
                 }
                 matches = self.model_matcher(data)['matches0'][0]
                 valid = matches > -1
+                
+                if rank == 0:
+                    print(f"[DEBUG] Rank 0 Matches Found: {valid.sum().item()}")
+
                 if valid.sum().item() < 4: continue
 
                 p3d_ids = np.array([p.point3D_id if p.has_point3D() else -1 for p in img_obj.points2D])
@@ -198,12 +342,24 @@ class LocalizationEngine:
                 valid_3d = m_db < len(p3d_ids)
                 m_q, m_db = m_q[valid_3d], m_db[valid_3d]
                 target_ids = p3d_ids[m_db]
+                
                 has_3d = target_ids != -1
                 if has_3d.sum() < 4: continue
 
-                p2d_local = kpts.cpu().numpy()[m_q[has_3d]].astype(np.float64)
-                p2d_local += 0.5
-                p3d_local = np.array([block['recon'].points3D[i].xyz for i in target_ids[has_3d]], dtype=np.float64)
+                m_q_valid = m_q[has_3d]
+                target_ids_valid = target_ids[has_3d]
+
+                # De-duplication Logic
+                unique_indices = []
+                for i, q_idx in enumerate(m_q_valid):
+                    if q_idx not in seen_queries:
+                        seen_queries.add(q_idx)
+                        unique_indices.append(i)
+                
+                if not unique_indices: continue
+                
+                p2d_local = kpts.cpu().numpy()[m_q_valid[unique_indices]].astype(np.float64)
+                p3d_local = np.array([block['recon'].points3D[tid].xyz for tid in target_ids_valid[unique_indices]], dtype=np.float64)
                 
                 p2d_list.append(p2d_local)
                 p3d_list.append(p3d_local)
@@ -222,6 +378,8 @@ class LocalizationEngine:
             if not p2d_list: continue
             p2d_concat = np.concatenate(p2d_list, axis=0)
             p3d_concat = np.concatenate(p3d_list, axis=0)
+            
+            print(f"[DEBUG] Total PnP Points (Unique): {len(p2d_concat)}")
             
             try:
                 ret = pycolmap.estimate_and_refine_absolute_pose(
@@ -248,6 +406,7 @@ class LocalizationEngine:
                             if success: ret = ret_ransac 
 
                     if success:
+                        print(f"[DEBUG] PnP Success! Inliers: {num_inliers}")
                         if isinstance(ret, dict):
                             if 'qvec' in ret: q_raw, tvec = ret['qvec'], ret['tvec']
                             elif 'cam_from_world' in ret:
@@ -261,16 +420,24 @@ class LocalizationEngine:
                             qvec = np.array([q_raw[3], q_raw[0], q_raw[1], q_raw[2]])
 
                 if success and qvec is not None:
-                    best_result = {
+                    res = {
                         'success': True, 'block': block_name, 
                         'pose': {'qvec': qvec, 'tvec': tvec}, 
                         'transform': block['transform'], 'inliers': num_inliers,
                         'matched_db_name': viz_details.get('matched_db_name', 'unknown')
                     }
-                    if return_details: best_result.update(viz_details)
-                    break
+                    if return_details: res.update(viz_details)
+                    valid_block_results.append(res)
+                    # [Consistency] 不在這裡 break，而是繼續檢查其他 block (如果有)
             except Exception as e:
                 print(f"[Error] PnP failed for {block_name}: {e}"); continue
         
-        if best_result is None: best_result = {'success': False, 'inliers': 0}
+        # 迴圈結束後，擇優錄取
+        if valid_block_results:
+            valid_block_results.sort(key=lambda x: x['inliers'], reverse=True)
+            best_result = valid_block_results[0]
+            print(f"[DEBUG] Final Winner: {best_result['block']} ({best_result['inliers']} inliers)")
+        else:
+            best_result = {'success': False, 'inliers': 0}
+            
         return best_result
