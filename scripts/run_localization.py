@@ -74,21 +74,25 @@ def main():
     viz_dir_3d = args.query_dir.parent / "viz_3d"
     if args.viz: 
         viz_dir_2d.mkdir(exist_ok=True, parents=True)
-        # viz_dir_3d will be created by visualize_sfm_open3d
 
     results_lines = []
     success_blocks = [] # Track which blocks were matched
     success_count = 0
     
-    # [New] Initialize CSV Report
+    # Initialize CSV Report
     print(f"[Info] Diagnosis report will be saved to: {args.report}")
     csv_file = open(args.report, 'w', newline='')
     csv_writer = csv.writer(csv_file)
     csv_header = [
         "ImageName", "Status", 
-        "Top1_Block", "Top1_Score", "Top2_Block", "Top2_Score", 
-        "Selected_Block", 
-        "Num_Keypoints", "Num_Matches_2D", "Num_Matches_3D", "PnP_Inliers"
+        "Selected_Block", "PnP_Inliers",
+        # [Corrected] 加入 Top1 與 Top2 進行比較
+        "Top1_Block", "Top1_Score", 
+        "Top2_Block", "Top2_Score",
+        "R1_Name", "R1_Match",  # Rank 1 DB info
+        "R2_Name", "R2_Match",  # Rank 2 DB info
+        "R3_Name", "R3_Match",  # Rank 3 DB info
+        "Num_Keypoints", "Num_Matches_2D", "Num_Matches_3D"
     ]
     csv_writer.writerow(csv_header)
 
@@ -98,28 +102,45 @@ def main():
         if img is None: print("[Error] Read failed"); continue
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        # Call localization with detail return to get diagnosis
+        # Call localization
         ret = engine.localize(img, fov_deg=fov, return_details=args.viz)
         
-        # [New] Extract Diagnosis Data
+        # Extract Diagnosis Data
         diag = ret.get('diagnosis', {})
+        ranks = diag.get('db_ranks', [])
+        while len(ranks) < 3: ranks.append({'name': 'None', 'matches_2d': 0})
         
+        # Determine the owner block for these ranks
+        rank_owner = diag.get('selected_block')
+        if rank_owner == 'None' or not rank_owner:
+            rank_owner = diag.get('top1_block', 'None')
+            
+        def fmt_rank_name(name):
+            if name == 'None': return 'None'
+            return f"{rank_owner}/{name}"
+
         # Write to CSV
         row = [
             q_path.name,
             diag.get('status', 'Unknown'),
+            diag.get('selected_block', 'None'),
+            diag.get('pnp_inliers', 0),
+            # [Corrected] 寫入 Top1 與 Top2
             diag.get('top1_block', 'None'),
             f"{diag.get('top1_score', 0.0):.4f}",
             diag.get('top2_block', 'None'),
             f"{diag.get('top2_score', 0.0):.4f}",
-            diag.get('selected_block', 'None'),
+            
+            fmt_rank_name(ranks[0]['name']), ranks[0]['matches_2d'],
+            fmt_rank_name(ranks[1]['name']), ranks[1]['matches_2d'],
+            fmt_rank_name(ranks[2]['name']), ranks[2]['matches_2d'],
+            
             diag.get('num_kpts', 0),
             diag.get('num_matches_2d', 0),
-            diag.get('num_matches_3d', 0),
-            diag.get('pnp_inliers', 0)
+            diag.get('num_matches_3d', 0)
         ]
         csv_writer.writerow(row)
-        csv_file.flush() # Ensure data is written immediately
+        csv_file.flush()
 
         if ret['success']:
             print(f"✅ Block: {ret['block']} ({ret['inliers']} inliers)")
@@ -130,17 +151,17 @@ def main():
             line = f"{q_path.name} {qvec[0]} {qvec[1]} {qvec[2]} {qvec[3]} {tvec[0]} {tvec[1]} {tvec[2]} {ret['block']}"
             results_lines.append(line)
             
-            # [Viz 1/2] 2D Matches
             if args.viz and 'matches' in ret:
                 draw_matches(img, ret['db_image_path'], ret['kpts_query'], ret['kpts_db'], ret['matches'], viz_dir_2d / f"{q_path.stem}_matches.jpg")
         else:
-            # [New] Print Detailed Failure Reason
             status = diag.get('status', 'Failed')
             top1 = diag.get('top1_block', 'None')
             score = diag.get('top1_score', 0.0)
-            print(f"❌ {status} (Top1: {top1}, Score: {score:.2f})")
+            
+            r1_name = fmt_rank_name(ranks[0]['name'])
+            r1_m = ranks[0]['matches_2d']
+            print(f"❌ {status} (Top1: {top1}, Score: {score:.2f}) -> BestDB: {r1_name} ({r1_m} matches)")
 
-    # Close CSV
     csv_file.close()
 
     with open(args.output, 'w') as f:
@@ -150,23 +171,18 @@ def main():
     print(f"Results saved to: {args.output}")
     print(f"Full diagnosis report: {args.report}")
 
-    # [Viz 2/2] 3D Point Cloud (Batch Generation)
     if args.viz and success_count > 0:
         print("\n=== Generating 3D Visualizations ===")
-        
-        # 取得所有成功定位的 Block (去重)
         unique_blocks = set(success_blocks)
         
         for block_name in unique_blocks:
             print(f"[Viz] Processing Block: {block_name}...")
             
-            # 決定 SfM 路徑
             ref_root = args.reference if args.reference else (project_root / "outputs-hloc")
             sfm_path = ref_root / block_name / "sfm_aligned"
             if not (sfm_path / "images.bin").exists():
                  sfm_path = ref_root / block_name / "sfm"
             
-            # 為每個 Block 建立獨立的輸出資料夾
             block_viz_dir = viz_dir_3d / block_name
             block_viz_dir.mkdir(parents=True, exist_ok=True)
             
@@ -175,8 +191,8 @@ def main():
                     sfm_dir=str(sfm_path),
                     output_dir=str(block_viz_dir),
                     query_poses=str(args.output),
-                    no_server=True,  # [Fix] 強制不跳出視窗
-                    target_block=block_name # [Fix] 指定 Block 名稱進行過濾
+                    no_server=True,
+                    target_block=block_name
                 )
             except Exception as e:
                 print(f"[Viz] Failed for {block_name}: {e}")
