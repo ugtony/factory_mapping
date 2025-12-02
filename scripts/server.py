@@ -1,7 +1,7 @@
 # scripts/server.py
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from typing import Optional
+from typing import Optional, Dict, Any
 from pydantic import BaseModel
 import numpy as np
 import cv2
@@ -39,6 +39,8 @@ class LocalizeResponse(BaseModel):
     map_y: float = None
     map_yaw: float = None
     latency_ms: float = 0.0
+    # [New] 新增診斷欄位 (允許任意字典內容)
+    diagnosis: Optional[Dict[str, Any]] = None
 
 @app.post("/localize", response_model=LocalizeResponse)
 async def localize_endpoint(file: UploadFile = File(...), fov: Optional[float] = Form(None)):
@@ -49,21 +51,25 @@ async def localize_endpoint(file: UploadFile = File(...), fov: Optional[float] =
     if img is None: raise HTTPException(status_code=400, detail="Invalid image")
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    # 實際使用的 FOV
-    actual_fov = fov if fov is not None else engine.default_fov
-
+    # 呼叫 Engine (return_details=False 仍會回傳 diagnosis 數據)
     result = engine.localize(img, fov_deg=fov, return_details=False)
     dt = (time.time() - t0) * 1000
     
+    # 提取診斷資訊 (若無則為空字典)
+    diag_data = result.get('diagnosis', {})
+
     if not result['success']:
-        return {"status": "failed", "latency_ms": dt}
+        return {
+            "status": "failed", 
+            "latency_ms": dt,
+            "diagnosis": diag_data  # [New] 失敗時回傳診斷
+        }
     
     q, t = result['pose']['qvec'], result['pose']['tvec']
     trans = result['transform']
     
-    # [Fix] 使用標準函式進行四元數轉換，修正順序錯誤
+    # 座標轉換
     q_scipy = colmap_to_scipy_quat(q)
-    
     R_w2c = Rotation.from_quat(q_scipy).as_matrix()
     R_c2w = R_w2c.T
     cam_center_sfm = -R_c2w @ t
@@ -81,7 +87,8 @@ async def localize_endpoint(file: UploadFile = File(...), fov: Optional[float] =
     return {
         "status": "success", "block": result['block'], "inliers": result['inliers'],
         "map_x": float(p_map[0]), "map_y": float(p_map[1]), "map_yaw": float(map_yaw),
-        "latency_ms": dt
+        "latency_ms": dt,
+        "diagnosis": diag_data # [New] 成功時也回傳診斷
     }
 
 if __name__ == "__main__":

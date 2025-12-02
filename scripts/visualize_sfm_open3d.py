@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-visualize_sfm_open3d.py [V11]
-- [Fix] 修正 Camera 圖層的可視性邏輯：使用 "legendonly" 代替 False，確保可以在 Legend 中切換 On/Off。
-- [Feature] 保留 Block Filter (Query 過濾)、統計濾波 (尺度修復)、智慧縮放 (Smart Scale)。
+visualize_sfm_open3d.py [V12-Open3D-Optimized]
+- [Feature] 整合 Open3D 進行點雲降噪 (Statistical Outlier Removal) 與 降取樣 (Voxel Downsampling)。
+- [Preserved] 保留 Camera 圖層的 "legendonly" 開關功能。
+- [Preserved] 保留 Block Filter (Query 過濾)、統計濾波 (尺度修復)、智慧縮放 (Smart Scale)。
 """
 
 import os
@@ -16,6 +17,9 @@ from socketserver import TCPServer
 import plotly.graph_objects as go
 import plotly.io as pio
 from collections import defaultdict 
+
+# [New] 引入 Open3D 進行點雲優化
+import open3d as o3d
 
 # ---------- 3D 轉換輔助 ----------
 def qvec2rotmat(q):
@@ -47,17 +51,43 @@ def make_frustum_lines(C, R, scale=0.25):
         zs += [pts[a,2], pts[b,2], None]
     return xs, ys, zs
 
-# ---------- 彩色點雲擷取 ----------
-def extract_colored_points(rec: pycolmap.Reconstruction):
+# ---------- [Modified] Open3D 優化版點雲擷取 ----------
+def extract_colored_points(rec: pycolmap.Reconstruction, voxel_size=0.1, nb_neighbors=20, std_ratio=2.0):
     coords, colors = [], []
     for p in rec.points3D.values():
         coords.append(np.asarray(p.xyz, dtype=float))
-        c = np.asarray(p.rgb if hasattr(p, "rgb") else p.color, dtype=float)
-        c = np.clip(c, 0, 255).astype(float)
-        colors.append(f"rgb({int(c[0])},{int(c[1])},{int(c[2])})")
-    if not coords:
-        return None, None
-    return np.vstack(coords), colors
+        # 處理顏色歸一化 (0~1) 給 Open3D 使用
+        c = np.asarray(p.rgb if hasattr(p, "rgb") else p.color, dtype=float) / 255.0
+        colors.append(c)
+    
+    if not coords: return None, None
+
+    # 1. 轉為 Open3D 格式
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.vstack(coords))
+    pcd.colors = o3d.utility.Vector3dVector(np.vstack(colors))
+
+    print(f"  [PCD] 原始點數: {len(pcd.points)}")
+
+    # 2. 體素降取樣 (Voxel Downsampling) - 讓密度均勻
+    if voxel_size > 0:
+        pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+        print(f"  [PCD] 降取樣後: {len(pcd.points)}")
+
+    # 3. 統計濾波 (Statistical Outlier Removal) - 去除雜訊
+    if nb_neighbors > 0:
+        cl, ind = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
+        pcd = pcd.select_by_index(ind)
+        print(f"  [PCD] 去噪後: {len(pcd.points)}")
+
+    # 4. 轉回 Plotly 格式 (Strings for RGB)
+    if len(pcd.points) == 0: return None, None
+    
+    final_pts = np.asarray(pcd.points)
+    final_cols_np = np.asarray(pcd.colors) * 255.0
+    final_cols = [f"rgb({int(c[0])},{int(c[1])},{int(c[2])})" for c in final_cols_np]
+
+    return final_pts, final_cols
 
 # ---------- 360 模式輔助 ----------
 SUFFIXES_360 = ('_F', '_R', '_B', '_L', '_FR', '_FL', '_RB', '_BL', '_LF')
@@ -96,7 +126,7 @@ def load_query_poses(path, target_block=None):
     print(f"[Info] Loaded {len(poses)} query poses (Filter: {target_block}).")
     return poses
 
-# ---------- 繪製相機圖層 ----------
+# ---------- 繪製相機圖層 (保留開關功能) ----------
 def create_camera_traces(image_list, total, suffix, colorscale, prefix, visible, **kwargs):
     all_xs, all_ys, all_zs = [], [], []
     names, l_xs, l_ys, l_zs = [], [], [], []
@@ -117,7 +147,7 @@ def create_camera_traces(image_list, total, suffix, colorscale, prefix, visible,
             l_xs.append(C[0]); l_ys.append(C[1]); l_zs.append(C[2])
         except: continue
     
-    # [Fix] 使用 "legendonly" 而非 False，確保在 Legend 中可以點擊開啟
+    # [保留功能] 使用 "legendonly" 確保可以在 Legend 中切換 On/Off
     vis_val = True if visible else "legendonly"
 
     line = go.Scatter3d(
@@ -181,23 +211,25 @@ def main(sfm_dir, output_dir, port=8080, query_poses=None, no_server=False, targ
 
     data = []
 
-    # --- 1. Point Cloud (Filter by Camera Bounds) ---
-    pts, cols = extract_colored_points(rec)
+    # --- 1. Point Cloud (Optimized with Open3D) ---
+    # 參數建議: voxel_size=0.1 (10cm), std_ratio=1.5 (適度去噪)
+    pts, cols = extract_colored_points(rec, voxel_size=0.1, nb_neighbors=20, std_ratio=1.5)
+    
     if pts is not None and len(pts) > 0:
         if valid_bounds is not None:
             min_b, max_b = valid_bounds
             mask_p = np.all((pts >= min_b) & (pts <= max_b), axis=1)
             pts, cols = pts[mask_p], np.array(cols)[mask_p]
-            print(f"[Info] Points Filtered: {len(mask_p)} -> {len(pts)}")
+            print(f"[Info] Points Filtered by Bounds: {len(mask_p)} -> {len(pts)}")
         
         data.append(go.Scatter3d(
             x=pts[:,0], y=pts[:,1], z=pts[:,2], mode="markers",
-            marker=dict(size=2, color=cols.tolist(), opacity=0.95),
-            name="Colored PCD"
+            # [調整] marker size 改小一點 (1.2) 以配合降取樣後的精緻度
+            marker=dict(size=1.2, color=cols, opacity=0.9),
+            name="Colored PCD (Cleaned)"
         ))
 
     # --- 2. DB Cameras (Smart Scale) ---
-    # Smart Scale Refinement based on baseline
     if len(all_cameras_sorted) > 1:
         try:
             centers = np.array([im.projection_center() for im in all_cameras_sorted])
@@ -235,7 +267,6 @@ def main(sfm_dir, output_dir, port=8080, query_poses=None, no_server=False, targ
                 l, t = create_camera_traces(subset, len(imgs_idx), suff, 'Viridis', 'DB', suff=="100%", frustum_scale=scene_scale)
                 data.append(l); data.append(t)
             
-            # Front only
             fronts = [(im, i) for im, i in imgs_idx if os.path.splitext(im.name)[0].endswith("_F")]
             if fronts:
                 l, t = create_camera_traces(fronts, len(imgs_idx), "Front", 'Viridis', 'DB', False, frustum_scale=scene_scale)
@@ -254,10 +285,8 @@ def main(sfm_dir, output_dir, port=8080, query_poses=None, no_server=False, targ
         q_x, q_y, q_z = [], [], []
         q_n, q_lx, q_ly, q_lz = [], [], [], []
         for name, C, R in qposes:
-            # Query Filter: also hide queries if far outside bounds (optional safety)
             if valid_bounds is not None:
                 min_b, max_b = valid_bounds
-                # Allow 2x margin for queries
                 if not (np.all(C >= min_b - 50) and np.all(C <= max_b + 50)): continue
 
             xs, ys, zs = make_frustum_lines(C, R, scale=scene_scale*1.5)

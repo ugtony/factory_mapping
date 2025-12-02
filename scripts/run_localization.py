@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+import csv
 from pathlib import Path
 from collections import Counter
 
@@ -53,6 +54,7 @@ def main():
     parser.add_argument("--reference", type=Path, help="Path to hloc outputs root")
     parser.add_argument("--fov", type=float, default=None)
     parser.add_argument("--output", type=Path, default="offline_results.txt")
+    parser.add_argument("--report", type=Path, default="diagnosis_report.csv", help="Output diagnosis CSV report")
     parser.add_argument("--viz", action="store_true", help="Visualize both 2D matches and 3D point cloud")
     args = parser.parse_args()
 
@@ -78,14 +80,47 @@ def main():
     success_blocks = [] # Track which blocks were matched
     success_count = 0
     
+    # [New] Initialize CSV Report
+    print(f"[Info] Diagnosis report will be saved to: {args.report}")
+    csv_file = open(args.report, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_header = [
+        "ImageName", "Status", 
+        "Top1_Block", "Top1_Score", "Top2_Block", "Top2_Score", 
+        "Selected_Block", 
+        "Num_Keypoints", "Num_Matches_2D", "Num_Matches_3D", "PnP_Inliers"
+    ]
+    csv_writer.writerow(csv_header)
+
     for q_path in query_files:
         print(f"Processing {q_path.name}...", end=" ", flush=True)
         img = cv2.imread(str(q_path))
         if img is None: print("[Error] Read failed"); continue
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
+        # Call localization with detail return to get diagnosis
         ret = engine.localize(img, fov_deg=fov, return_details=args.viz)
         
+        # [New] Extract Diagnosis Data
+        diag = ret.get('diagnosis', {})
+        
+        # Write to CSV
+        row = [
+            q_path.name,
+            diag.get('status', 'Unknown'),
+            diag.get('top1_block', 'None'),
+            f"{diag.get('top1_score', 0.0):.4f}",
+            diag.get('top2_block', 'None'),
+            f"{diag.get('top2_score', 0.0):.4f}",
+            diag.get('selected_block', 'None'),
+            diag.get('num_kpts', 0),
+            diag.get('num_matches_2d', 0),
+            diag.get('num_matches_3d', 0),
+            diag.get('pnp_inliers', 0)
+        ]
+        csv_writer.writerow(row)
+        csv_file.flush() # Ensure data is written immediately
+
         if ret['success']:
             print(f"✅ Block: {ret['block']} ({ret['inliers']} inliers)")
             success_count += 1
@@ -98,13 +133,22 @@ def main():
             # [Viz 1/2] 2D Matches
             if args.viz and 'matches' in ret:
                 draw_matches(img, ret['db_image_path'], ret['kpts_query'], ret['kpts_db'], ret['matches'], viz_dir_2d / f"{q_path.stem}_matches.jpg")
-        else: print("❌ Failed")
+        else:
+            # [New] Print Detailed Failure Reason
+            status = diag.get('status', 'Failed')
+            top1 = diag.get('top1_block', 'None')
+            score = diag.get('top1_score', 0.0)
+            print(f"❌ {status} (Top1: {top1}, Score: {score:.2f})")
+
+    # Close CSV
+    csv_file.close()
 
     with open(args.output, 'w') as f:
         f.write("# ImageName Qw Qx Qy Qz Tx Ty Tz BlockName\n")
         for line in results_lines: f.write(line + "\n")
     print(f"\nSummary: {success_count}/{len(query_files)} localized.")
     print(f"Results saved to: {args.output}")
+    print(f"Full diagnosis report: {args.report}")
 
     # [Viz 2/2] 3D Point Cloud (Batch Generation)
     if args.viz and success_count > 0:
