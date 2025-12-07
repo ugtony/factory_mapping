@@ -56,6 +56,7 @@ def main():
     parser.add_argument("--output", type=Path, default="offline_results.txt")
     parser.add_argument("--report", type=Path, default="diagnosis_report.csv", help="Output diagnosis CSV report")
     parser.add_argument("--viz", action="store_true", help="Visualize both 2D matches and 3D point cloud")
+    parser.add_argument("--verbose", action="store_true", help="Enable detailed logging from localization engine")
     args = parser.parse_args()
 
     engine = LocalizationEngine(
@@ -86,7 +87,6 @@ def main():
     csv_header = [
         "ImageName", "Status", 
         "Selected_Block", "PnP_Inliers",
-        # [Corrected] 加入 Top1 與 Top2 進行比較
         "Top1_Block", "Top1_Score", 
         "Top2_Block", "Top2_Score",
         "R1_Name", "R1_Match",  # Rank 1 DB info
@@ -98,12 +98,14 @@ def main():
 
     for q_path in query_files:
         print(f"Processing {q_path.name}...", end=" ", flush=True)
+        # 若 verbose 開啟，換行以免 Log 擠在一起
+        if args.verbose: print("") 
+
         img = cv2.imread(str(q_path))
         if img is None: print("[Error] Read failed"); continue
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        # Call localization
-        ret = engine.localize(img, fov_deg=fov, return_details=args.viz)
+        ret = engine.localize(img, fov_deg=fov, return_details=args.viz, verbose=args.verbose)
         
         # Extract Diagnosis Data
         diag = ret.get('diagnosis', {})
@@ -125,7 +127,6 @@ def main():
             diag.get('status', 'Unknown'),
             diag.get('selected_block', 'None'),
             diag.get('pnp_inliers', 0),
-            # [Corrected] 寫入 Top1 與 Top2
             diag.get('top1_block', 'None'),
             f"{diag.get('top1_score', 0.0):.4f}",
             diag.get('top2_block', 'None'),
@@ -143,7 +144,11 @@ def main():
         csv_file.flush()
 
         if ret['success']:
-            print(f"✅ Block: {ret['block']} ({ret['inliers']} inliers)")
+            if args.verbose:
+                print(f"  ✅ [Result] Block: {ret['block']} ({ret['inliers']} inliers)")
+            else:
+                print(f"✅ Block: {ret['block']} ({ret['inliers']} inliers)")
+            
             success_count += 1
             success_blocks.append(ret['block'])
             

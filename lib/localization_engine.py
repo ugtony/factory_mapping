@@ -114,7 +114,7 @@ class LocalizationEngine:
             }
 
     @torch.no_grad()
-    def localize(self, image_arr: np.ndarray, fov_deg: float = None, return_details: bool = False, top_k_db: int = 10):
+    def localize(self, image_arr: np.ndarray, fov_deg: float = None, return_details: bool = False, top_k_db: int = 10, verbose: bool = False):
         if fov_deg is None: fov_deg = self.default_fov
         
         h_orig, w_orig = image_arr.shape[:2]
@@ -146,6 +146,10 @@ class LocalizationEngine:
         kpts = q_local['keypoints'][0]
         desc = q_local['descriptors'][0]
         
+        # [Log] 印出 Query 基本資訊
+        if verbose:
+            print(f"  [Log] Query Kpts: {len(kpts)} (Scale: {scale_x:.4f}, {scale_y:.4f})")
+        
         # [Init Diagnosis]
         diag = {
             'num_kpts': len(kpts),
@@ -159,7 +163,7 @@ class LocalizationEngine:
 
         # [Fix 3] Coordinate Restoration (關鍵座標修正)
         # 1. 還原到原始影像的 0-based 座標
-        # 2. 加上 0.5 以對齊 HLOC/COLMAP 的座標定義
+        # 2. 加上 0.5 以對齊 HLOC/COLMAP 的座標定義 (localize_sfm.py line 70: kpq += 0.5)
         # 公式簡化： ((k + 0.5) * s - 0.5) + 0.5  ==>  (k + 0.5) * s
         kpts[:, 0] = (kpts[:, 0] + 0.5) * scale_x
         kpts[:, 1] = (kpts[:, 1] + 0.5) * scale_y
@@ -196,11 +200,15 @@ class LocalizationEngine:
             return {'success': False, 'inliers': 0, 'diagnosis': diag}
 
         valid_block_results = []
-        # [Fix 4] 移除 seen_queries，允許不同 Block/Image 競爭特徵點
+        # [Fix 4] 移除 seen_queries，允許不同 Block/Image 競爭特徵點 (Zero Greedy)
         # seen_queries = set() 
         best_fail_stats = diag.copy()
 
         for _, block_name, sim_matrix in candidate_blocks:
+            # [Log] 印出 Block 資訊
+            if verbose:
+                print(f"  [Log] Checking Block: {block_name}")
+
             block = self.blocks[block_name]
             k_val = min(top_k_db, sim_matrix.shape[1])
             scores, indices = torch.topk(sim_matrix, k=k_val, dim=1)
@@ -235,13 +243,19 @@ class LocalizationEngine:
                 n_2d = valid.sum().item()
                 current_block_stats['matches_2d_sum'] += n_2d
                 
+                # [Log] 印出 2D Matches
+                if verbose:
+                    print(f"    > Rank {rank} ({db_name}): 2D Matches = {n_2d}", end="")
+                
                 if rank < 3:
                     current_db_ranks.append({
                         'name': db_name,
                         'matches_2d': n_2d
                     })
 
-                if n_2d < 4: continue
+                if n_2d < 4: 
+                    if verbose: print(" (Skipped: <4 2D)")
+                    continue
 
                 p3d_ids = np.array([p.point3D_id if p.has_point3D() else -1 for p in img_obj.points2D])
                 m_q = torch.where(valid)[0].cpu().numpy()
@@ -253,12 +267,18 @@ class LocalizationEngine:
                 n_3d = has_3d.sum()
                 current_block_stats['matches_3d_sum'] += n_3d
                 
-                if n_3d < 4: continue
+                # [Log] 印出 3D Points
+                if verbose:
+                    print(f", 3D Points = {n_3d}", end="")
+
+                if n_3d < 4:
+                    if verbose: print(" (Skipped: <4 3D)")
+                    continue
                 
                 m_q_valid = m_q[has_3d]
                 target_ids_valid = target_ids[has_3d]
                 
-                # [Fix 4 cont.] 移除過濾邏輯，直接使用所有有效匹配
+                # [Fix 4 cont.] 移除貪婪過濾邏輯，直接使用所有有效匹配
                 if len(m_q_valid) == 0: continue
                 
                 p2d_local = kpts.cpu().numpy()[m_q_valid].astype(np.float64)
@@ -266,6 +286,8 @@ class LocalizationEngine:
                 
                 p2d_list.append(p2d_local)
                 p3d_list.append(p3d_local)
+                
+                if verbose: print(" -> Added")
                 
                 if rank == 0:
                     viz_details['matched_db_name'] = db_name
@@ -283,6 +305,10 @@ class LocalizationEngine:
             p2d_concat = np.concatenate(p2d_list, axis=0)
             p3d_concat = np.concatenate(p3d_list, axis=0)
             
+            # [Log] 印出 PnP 輸入總數
+            if verbose:
+                print(f"    [PnP Input] Total 2D-3D Correspondences: {len(p2d_concat)}")
+            
             try:
                 # [Fix 5] 強制啟用 PnP 優化 (Refine Focal Length)
                 refine_opts = pycolmap.AbsolutePoseRefinementOptions()
@@ -292,7 +318,7 @@ class LocalizationEngine:
                 ret = pycolmap.estimate_and_refine_absolute_pose(
                     p2d_concat, p3d_concat, camera, 
                     estimation_options={'ransac': {'max_error': 12.0}},
-                    #refinement_options=refine_opts
+                    refinement_options=refine_opts
                 )
                 success, qvec, tvec, num_inliers = False, None, None, 0
                 
@@ -330,6 +356,18 @@ class LocalizationEngine:
                         if q_raw is not None:
                             # Colmap quat is [w, x, y, z]
                             qvec = np.array([q_raw[3], q_raw[0], q_raw[1], q_raw[2]])
+
+                    # 過濾掉 Inliers 過少的「偽陽性」結果
+                    # 數學上有解(Success)不代表定位可靠，通常需要至少 15 個點
+                    if num_inliers < 15:
+                        success = False
+                        if verbose: print(f"    [Filter] Low inliers ({num_inliers} < 15), marking as Failed.")
+
+                # [Log] 印出 PnP 結果
+                if verbose and success:
+                    print(f"    [PnP Result] Success! Inliers: {num_inliers}")
+                elif verbose:
+                    print(f"    [PnP Result] Failed.")
 
                 if success and qvec is not None:
                     res_diag = diag.copy()

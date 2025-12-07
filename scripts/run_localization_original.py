@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-run_localization_original.py [Refactored with Diagnosis Report]
-舊版定位腳本（加上 CSV 診斷報告功能以便與新版比對）。
+run_localization_original.py [Advanced Diagnosis Version]
+用途：執行標準 HLOC 定位流程，並產生詳細的診斷報告與 Log 分析。
+特點：
+1. 產生 diagnosis_report_original.csv，格式與新版對齊。
+2. 執行後會自動分析中間檔 (matches.h5, _logs.pkl)，印出 2D/3D 匹配數統計。
 """
 
 import argparse
@@ -10,7 +13,8 @@ import os
 import numpy as np
 import h5py
 import shutil
-import csv  # [New]
+import csv
+import pickle
 from pathlib import Path
 from collections import defaultdict
 import cv2
@@ -82,7 +86,7 @@ def main():
     default_fov = float(config.get("FOV", 69.4))
     default_global = config.get("GLOBAL_CONF", "netvlad")
 
-    parser = argparse.ArgumentParser(description="Unified HLOC Localization Pipeline (Original + Report)")
+    parser = argparse.ArgumentParser(description="Unified HLOC Localization Pipeline (Diagnosis Version)")
     parser.add_argument("--query_dir", type=Path, required=True, help="Directory containing query images")
     parser.add_argument("--reference", "--ref", dest="reference", type=Path, required=True)
     parser.add_argument("--global-conf", type=str, default=default_global)
@@ -90,11 +94,9 @@ def main():
     parser.add_argument("--num_retrieval", type=int, default=10)
     parser.add_argument("--top_k", type=int, default=3)
     
-    # [New] 新增報告參數
+    # [New] 報告輸出路徑
     parser.add_argument("--report", type=Path, default="diagnosis_report_original.csv", help="Output diagnosis CSV report")
     
-    parser.add_argument("--viz_retrieval", action="store_true")
-    parser.add_argument("--viz_matches", action="store_true")
     parser.add_argument("--viz_3d", action="store_true")
     args = parser.parse_args()
 
@@ -104,8 +106,7 @@ def main():
     
     print(f"=== Localization Pipeline: {mode} Mode ===")
     
-    # [New] 初始化診斷資料結構
-    # diagnosis_data[q_name] = { 'top1_block':..., 'top1_score':..., 'block_inliers': {block_name: count} }
+    # 初始化診斷資料結構
     diagnosis_data = defaultdict(lambda: {
         'top1_block': 'None', 'top1_score': 0.0,
         'top2_block': 'None', 'top2_score': 0.0,
@@ -136,7 +137,6 @@ def main():
     if mode == "SINGLE":
         for q in query_images: 
             block_tasks[ref_path].append(q)
-            # 單一區塊模式，強制設定 Top1 為該區塊
             diagnosis_data[q]['top1_block'] = ref_path.name
             diagnosis_data[q]['top1_score'] = 1.0
     else:
@@ -145,8 +145,7 @@ def main():
         
         candidate_blocks = [d for d in ref_path.iterdir() if d.is_dir() and (d / f"global-{args.global_conf}.h5").exists()]
         
-        # 暫存所有分數以便後續排序
-        # main.query_block_scores[q_name] = [ (score, block_dir), ... ]
+        # 暫存分數
         if not hasattr(main, "query_block_scores"): main.query_block_scores = defaultdict(list)
 
         for block_dir in candidate_blocks:
@@ -171,7 +170,6 @@ def main():
         for q_name, scores in main.query_block_scores.items():
             scores.sort(key=lambda x: x[0], reverse=True)
             
-            # [New] 紀錄 Retrieval 診斷資訊
             if len(scores) > 0:
                 diagnosis_data[q_name]['top1_block'] = scores[0][1].name
                 diagnosis_data[q_name]['top1_score'] = float(scores[0][0])
@@ -190,6 +188,7 @@ def main():
     for block_dir, q_list in block_tasks.items():
         if not q_list: continue
         block_name = block_dir.name
+        print(f"\n--- Processing Block: {block_name} ({len(q_list)} queries) ---")
         
         block_q_list_path = work_dir / f"queries_{block_name}.txt"
         with open(block_q_list_path, 'w') as f:
@@ -210,11 +209,13 @@ def main():
         if not local_candidates: continue
         db_local = local_candidates[0]
         
+        # 1. Retrieval
         pairs_from_retrieval(
             feats_global_q, pairs_path, num_matched=args.num_retrieval,
             query_list=block_q_list_path, db_list=None, db_descriptors=db_global
         )
         
+        # 2. Merge Features
         merged_feats = work_dir / f"feats_merged_{block_name}.h5"
         if merged_feats.exists(): merged_feats.unlink()
         if matches_path.exists(): matches_path.unlink()
@@ -229,11 +230,13 @@ def main():
                         if name not in f_out: f_out[name] = h5py.ExternalLink(str(db_local), name)
                 f_db.visititems(visit_link)
 
+        # 3. Match
         match_features(
             match_confs['superpoint+lightglue'], pairs_path, 
             features=merged_feats, matches=matches_path
         )
         
+        # 4. Localize (PnP)
         try:
             localize_sfm(
                 sfm_dir, block_q_list_path, pairs_path, 
@@ -243,22 +246,74 @@ def main():
         except Exception as e:
             print(f"[Error] Localization failed: {e}"); continue
 
-        # [Refactor] 讀取 Log 並儲存到診斷資料
-        log_path = Path(str(results_path) + "_logs.pkl")
-        inliers_map = parse_localization_log(log_path)
+        # ==========================================
+        # [New] 詳細 Log 分析區塊 (Post-Mortem Analysis)
+        # ==========================================
+        print(f"\n[Detailed Log Analysis for Block: {block_name}]")
         
-        # [New] 將每個 Query 在此 Block 的 Inliers 存入診斷
-        for q_in_block in q_list:
-            n_inliers = inliers_map.get(q_in_block, 0)
-            diagnosis_data[q_in_block]['block_inliers'][block_name] = n_inliers
+        # 1. 讀取 _logs.pkl 取得 PnP 統計
+        log_path = Path(str(results_path) + "_logs.pkl")
+        loc_logs = {}
+        if log_path.exists():
+            with open(log_path, 'rb') as f:
+                raw_log = pickle.load(f)
+                loc_logs = raw_log.get('loc', raw_log)
+        
+        # 2. 讀取 matches.h5 與 pairs.txt
+        matches_h5 = h5py.File(matches_path, 'r')
+        pairs_map = defaultdict(list)
+        if pairs_path.exists():
+            with open(pairs_path, 'r') as f:
+                for line in f:
+                    p = line.strip().split()
+                    if len(p) >= 2: pairs_map[p[0]].append(p[1])
 
+        # 3. 針對每個 Query 印出詳細資訊
+        for q_name in q_list:
+            # (A) Retrieval Info
+            retrieved_dbs = pairs_map.get(q_name, [])
+            
+            # (B) 2D Matches Info
+            matches_info = []
+            for db_name in retrieved_dbs[:3]: # 只看前 3 名
+                pair_key = get_matches_key(matches_h5, q_name, db_name)
+                n_matches = 0
+                if pair_key:
+                    # [Fix] pair_key 已經是 dataset 路徑 (例如 q/db/matches0)，不用再加 ['matches0']
+                    m = matches_h5[pair_key].__array__()
+                    n_matches = (m > -1).sum()
+                matches_info.append(f"{db_name}({n_matches})")
+            
+            # (C) PnP Stats
+            pnp_input = 0
+            inliers = 0
+            if q_name in loc_logs:
+                log_info = loc_logs[q_name]
+                pnp_input = log_info.get('num_matches', 0) # HLOC log 中 num_matches 指的是 2D-3D 對應數
+                pnp_ret = log_info.get('PnP_ret', {})
+                if isinstance(pnp_ret, dict):
+                    inliers = pnp_ret.get('num_inliers', 0)
+                else:
+                    inliers = getattr(pnp_ret, 'num_inliers', 0)
+            
+            # 簡潔輸出
+            print(f"  Q: {q_name} | PnP Input: {pnp_input} -> Inliers: {inliers}")
+            print(f"     Top-3 Matches: {', '.join(matches_info)}")
+
+            # 存入診斷資料
+            diagnosis_data[q_name]['block_inliers'][block_name] = inliers
+
+        matches_h5.close()
+        print("==========================================\n")
+
+        # 讀取 Pose 結果供合併用
         if results_path.exists():
             with open(results_path, 'r') as f:
                 for line in f:
                     if line.startswith('#'): continue
                     p = line.strip().split()
                     q_name = p[0]
-                    n_inliers = inliers_map.get(q_name, 0)
+                    n_inliers = diagnosis_data[q_name]['block_inliers'][block_name]
                     results_pool[q_name].append({
                         'block': block_name,
                         'inliers': n_inliers,
@@ -271,10 +326,8 @@ def main():
     
     print(f"\n[Info] Generating diagnosis report: {args.report}")
     
-    # [New] 寫入 CSV 報告
     with open(args.report, 'w', newline='') as csv_file:
         csv_writer = csv.writer(csv_file)
-        # 標題與新版盡量對齊 (Original 缺少 DB Rank 詳細匹配數，故省略)
         csv_header = [
             "ImageName", "Status", 
             "Selected_Block", "PnP_Inliers",
@@ -287,13 +340,12 @@ def main():
             candidates = results_pool.get(q, [])
             diag = diagnosis_data[q]
             
-            # 找出最佳結果
             if candidates:
                 candidates.sort(key=lambda x: x['inliers'], reverse=True)
                 best = candidates[0]
                 selected_block = best['block']
                 inliers = best['inliers']
-                status = "Success" if inliers > 10 else "Failed" # 簡單閾值
+                status = "Success" if inliers > 10 else "Failed"
                 
                 final_poses.append(f"{best['pose_str']} {selected_block}")
                 localized_count += 1
@@ -301,13 +353,10 @@ def main():
                 selected_block = "None"
                 inliers = 0
                 status = "Failed"
-                # 如果完全沒進入 PnP (candidates 為空)，嘗試檢查是否有被分配 Block
                 if diag['block_inliers']:
-                    # 曾被分配但全失敗，取最高 Inlier 的那個 (即使是 0)
                     best_fail_block = max(diag['block_inliers'], key=diag['block_inliers'].get)
                     selected_block = best_fail_block + "(Fail)"
 
-            # 準備寫入 CSV 的資料
             row = [
                 q, status, 
                 selected_block, inliers,
@@ -316,7 +365,7 @@ def main():
             ]
             csv_writer.writerow(row)
 
-    # 輸出最終 Pose 檔
+    # 輸出最終 Pose
     final_results_file = work_dir / "final_poses.txt"
     if final_poses:
         print(f"✅ Successfully localized {localized_count}/{len(query_images)} images.")
@@ -328,7 +377,13 @@ def main():
     else:
         print("\n[Warn] No images successfully localized.")
 
-    print(f"Comparison report saved to: {args.report}")
+    if args.viz_3d and HAS_VIZ_3D and final_poses:
+         print("[Viz] Generating 3D visualization...")
+         target_block = final_poses[0].split()[-1] 
+         sfm_dir = args.reference / target_block / "sfm_aligned"
+         if not (sfm_dir/"images.bin").exists(): sfm_dir = args.reference / target_block / "sfm"
+         viz_out = work_dir / "viz_3d" / target_block
+         visualize_sfm_open3d.main(str(sfm_dir), str(viz_out), query_poses=str(final_results_file), no_server=True)
 
 if __name__ == "__main__":
     main()
