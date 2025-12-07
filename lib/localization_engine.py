@@ -125,7 +125,7 @@ class LocalizationEngine:
         
         if max(h_orig, w_orig) >= resize_max:
             scale = resize_max / max(h_orig, w_orig)
-            # [Fix 1] 使用 round() 對齊 HLOC 的縮放邏輯，避免 1px 誤差
+            # [Fix 1] 使用 round() 對齊 HLOC 的縮放邏輯
             new_w, new_h = int(round(w_orig * scale)), int(round(h_orig * scale))
             # [Fix 2] 使用 INTER_AREA 提升縮圖後的特徵品質
             image_tensor = cv2.resize(image_arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
@@ -146,7 +146,6 @@ class LocalizationEngine:
         kpts = q_local['keypoints'][0]
         desc = q_local['descriptors'][0]
         
-        # [Log] 印出 Query 基本資訊
         if verbose:
             print(f"  [Log] Query Kpts: {len(kpts)} (Scale: {scale_x:.4f}, {scale_y:.4f})")
         
@@ -161,10 +160,7 @@ class LocalizationEngine:
             'db_ranks': [] 
         }
 
-        # [Fix 3] Coordinate Restoration (關鍵座標修正)
-        # 1. 還原到原始影像的 0-based 座標
-        # 2. 加上 0.5 以對齊 HLOC/COLMAP 的座標定義 (localize_sfm.py line 70: kpq += 0.5)
-        # 公式簡化： ((k + 0.5) * s - 0.5) + 0.5  ==>  (k + 0.5) * s
+        # [Fix 3] Coordinate Restoration (0.5 pixel offset for COLMAP)
         kpts[:, 0] = (kpts[:, 0] + 0.5) * scale_x
         kpts[:, 1] = (kpts[:, 1] + 0.5) * scale_y
         
@@ -200,12 +196,9 @@ class LocalizationEngine:
             return {'success': False, 'inliers': 0, 'diagnosis': diag}
 
         valid_block_results = []
-        # [Fix 4] 移除 seen_queries，允許不同 Block/Image 競爭特徵點 (Zero Greedy)
-        # seen_queries = set() 
         best_fail_stats = diag.copy()
 
         for _, block_name, sim_matrix in candidate_blocks:
-            # [Log] 印出 Block 資訊
             if verbose:
                 print(f"  [Log] Checking Block: {block_name}")
 
@@ -219,6 +212,10 @@ class LocalizationEngine:
             current_block_stats = {'matches_2d_sum': 0, 'matches_3d_sum': 0}
             
             current_db_ranks = [] 
+            
+            # [Fix 6] De-duplication Set (Query_Idx, 3D_Point_ID)
+            # 確保同一個 2D 點對應同一個 3D 點只會被加入一次
+            unique_matches = set()
 
             for rank, db_idx in enumerate(indices):
                 db_name = block['global_names'][db_idx]
@@ -243,7 +240,6 @@ class LocalizationEngine:
                 n_2d = valid.sum().item()
                 current_block_stats['matches_2d_sum'] += n_2d
                 
-                # [Log] 印出 2D Matches
                 if verbose:
                     print(f"    > Rank {rank} ({db_name}): 2D Matches = {n_2d}", end="")
                 
@@ -267,10 +263,6 @@ class LocalizationEngine:
                 n_3d = has_3d.sum()
                 current_block_stats['matches_3d_sum'] += n_3d
                 
-                # [Log] 印出 3D Points
-                if verbose:
-                    print(f", 3D Points = {n_3d}", end="")
-
                 if n_3d < 4:
                     if verbose: print(" (Skipped: <4 3D)")
                     continue
@@ -278,16 +270,38 @@ class LocalizationEngine:
                 m_q_valid = m_q[has_3d]
                 target_ids_valid = target_ids[has_3d]
                 
-                # [Fix 4 cont.] 移除貪婪過濾邏輯，直接使用所有有效匹配
-                if len(m_q_valid) == 0: continue
+                if len(m_q_valid) == 0: 
+                    if verbose: print(" (No Valid Points)")
+                    continue
                 
-                p2d_local = kpts.cpu().numpy()[m_q_valid].astype(np.float64)
-                p3d_local = np.array([block['recon'].points3D[tid].xyz for tid in target_ids_valid], dtype=np.float64)
+                # [Fix 6 cont.] 執行去重與格式轉換
+                new_p2d = []
+                new_p3d = []
                 
-                p2d_list.append(p2d_local)
-                p3d_list.append(p3d_local)
+                # 將特徵點轉為 numpy 以便操作
+                # kpts (N, 2) 已經還原並加上了 0.5
+                kpts_np = kpts.cpu().numpy()
+                points3D_map = block['recon'].points3D
                 
-                if verbose: print(" -> Added")
+                for q_idx, tid in zip(m_q_valid, target_ids_valid):
+                    q_idx = int(q_idx)
+                    tid = int(tid)
+                    
+                    # 檢查重複：(q_idx, tid) 組合
+                    if (q_idx, tid) not in unique_matches:
+                        unique_matches.add((q_idx, tid))
+                        new_p2d.append(kpts_np[q_idx])
+                        new_p3d.append(points3D_map[tid].xyz)
+                
+                if not new_p2d:
+                    if verbose: print(" (All Duplicate)")
+                    continue
+                
+                p2d_list.append(np.array(new_p2d, dtype=np.float64))
+                p3d_list.append(np.array(new_p3d, dtype=np.float64))
+                
+                if verbose: 
+                    print(f", 3D Points = {len(new_p2d)} (Unique) -> Added")
                 
                 if rank == 0:
                     viz_details['matched_db_name'] = db_name
@@ -305,12 +319,11 @@ class LocalizationEngine:
             p2d_concat = np.concatenate(p2d_list, axis=0)
             p3d_concat = np.concatenate(p3d_list, axis=0)
             
-            # [Log] 印出 PnP 輸入總數
             if verbose:
                 print(f"    [PnP Input] Total 2D-3D Correspondences: {len(p2d_concat)}")
             
             try:
-                # [Fix 5] 強制啟用 PnP 優化 (Refine Focal Length)
+                # [Fix 5] 強制啟用 PnP 優化
                 refine_opts = pycolmap.AbsolutePoseRefinementOptions()
                 refine_opts.refine_focal_length = True
                 refine_opts.refine_extra_params = False
@@ -329,11 +342,8 @@ class LocalizationEngine:
                     else:
                         success = ret.success
                         num_inliers = ret.num_inliers
-                        if success and ret.camera:
-                            pass # 這裡可以存取優化後的 f
 
                     if not success:
-                         # Fallback: Try basic estimation
                          ret_ransac = pycolmap.estimate_absolute_pose(
                              p2d_concat, p3d_concat, camera, estimation_options={'ransac': {'max_error': 12.0}}
                          )
@@ -342,6 +352,11 @@ class LocalizationEngine:
                                 if ret_ransac.get('num_inliers', 0) > 0: success = True
                             elif ret_ransac.num_inliers > 0: success = True
                             if success: ret = ret_ransac 
+
+                    # [Fix 7] 信心閾值過濾 (防止偽陽性)
+                    if success and num_inliers < 15:
+                        success = False
+                        if verbose: print(f"    [Filter] Low inliers ({num_inliers} < 15), marking as Failed.")
 
                     if success:
                         if isinstance(ret, dict):
@@ -354,16 +369,8 @@ class LocalizationEngine:
                                 q_raw = ret.cam_from_world.rotation.quat
                                 tvec = ret.cam_from_world.translation
                         if q_raw is not None:
-                            # Colmap quat is [w, x, y, z]
                             qvec = np.array([q_raw[3], q_raw[0], q_raw[1], q_raw[2]])
 
-                    # 過濾掉 Inliers 過少的「偽陽性」結果
-                    # 數學上有解(Success)不代表定位可靠，通常需要至少 15 個點
-                    if num_inliers < 15:
-                        success = False
-                        if verbose: print(f"    [Filter] Low inliers ({num_inliers} < 15), marking as Failed.")
-
-                # [Log] 印出 PnP 結果
                 if verbose and success:
                     print(f"    [PnP Result] Success! Inliers: {num_inliers}")
                 elif verbose:
