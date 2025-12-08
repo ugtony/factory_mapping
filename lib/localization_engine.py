@@ -184,6 +184,9 @@ class LocalizationEngine:
         
         candidate_blocks.sort(key=lambda x: x[0], reverse=True)
         
+        # [Modified] 強制只取前 3 名，對齊 Original 版本邏輯
+        candidate_blocks = candidate_blocks[:3]
+
         if len(candidate_blocks) > 0:
             diag['top1_block'] = candidate_blocks[0][1]
             diag['top1_score'] = candidate_blocks[0][0]
