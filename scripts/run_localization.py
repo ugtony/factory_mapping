@@ -68,7 +68,7 @@ def main():
     
     fov = args.fov if args.fov else engine.default_fov
     print(f"=== Starting Offline Localization (FOV={fov}) ===")
-    query_files = sorted([p for p in args.query_dir.glob("**/*") if p.suffix.lower() in {'.jpg','.png','.jpeg'}])
+    query_files = sorted([p for p in args.query_dir.glob("*") if p.is_file() and p.suffix.lower() in {'.jpg','.png','.jpeg'}])
     
     # Setup Viz Directories
     viz_dir_2d = args.query_dir.parent / "viz_offline"

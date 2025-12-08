@@ -117,8 +117,8 @@ def main():
     work_dir.mkdir(exist_ok=True, parents=True)
     
     query_images = sorted([p.relative_to(args.query_dir).as_posix() 
-                           for p in args.query_dir.glob("**/*") 
-                           if p.suffix.lower() in {'.jpg','.jpeg','.png'}])
+                           for p in args.query_dir.glob("*") 
+                           if p.is_file() and p.suffix.lower() in {'.jpg','.jpeg','.png'}])
     if not query_images: print("[Error] No query images."); return
 
     query_list_path = work_dir / "queries_with_intrinsics.txt"
