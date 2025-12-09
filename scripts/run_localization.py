@@ -87,11 +87,12 @@ def main():
     csv_header = [
         "ImageName", "Status", 
         "Selected_Block", "PnP_Inliers",
+        "Second_Block", "Second_Inliers",  # <--- [新增] 這兩欄
         "Top1_Block", "Top1_Score", 
         "Top2_Block", "Top2_Score",
-        "R1_Name", "R1_Match",  # Rank 1 DB info
-        "R2_Name", "R2_Match",  # Rank 2 DB info
-        "R3_Name", "R3_Match",  # Rank 3 DB info
+        "R1_Name", "R1_Match",
+        "R2_Name", "R2_Match",
+        "R3_Name", "R3_Match",
         "Num_Keypoints", "Num_Matches_2D", "Num_Matches_3D"
     ]
     csv_writer.writerow(csv_header)
@@ -127,6 +128,8 @@ def main():
             diag.get('status', 'Unknown'),
             diag.get('selected_block', 'None'),
             diag.get('pnp_inliers', 0),
+            diag.get('second_block', 'None'),
+            diag.get('second_inliers', 0),
             diag.get('top1_block', 'None'),
             f"{diag.get('top1_score', 0.0):.4f}",
             diag.get('top2_block', 'None'),

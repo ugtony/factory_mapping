@@ -405,7 +405,20 @@ class LocalizationEngine:
         if valid_block_results:
             valid_block_results.sort(key=lambda x: x['inliers'], reverse=True)
             best_result = valid_block_results[0]
+            
+            # [新增] 擷取第二名的 PnP 結果，用於計算 Inlier Gap
+            if len(valid_block_results) > 1:
+                second = valid_block_results[1]
+                best_result['diagnosis']['second_inliers'] = second['inliers']
+                best_result['diagnosis']['second_block'] = second['block']
+            else:
+                # 只有一個候選者成功 PnP
+                best_result['diagnosis']['second_inliers'] = 0
+                best_result['diagnosis']['second_block'] = "None"
         else:
             best_result = {'success': False, 'inliers': 0, 'diagnosis': best_fail_stats}
+            # 失敗時也要補上預設值，避免 Key Error
+            best_result['diagnosis']['second_inliers'] = 0
+            best_result['diagnosis']['second_block'] = "None"
             
         return best_result
