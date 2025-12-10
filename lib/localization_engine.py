@@ -52,10 +52,11 @@ class LocalizationEngine:
 
         print("[Init] Loading Neural Network Models (Offline Mode)...")
 
-        # 保存原始函數，避免無限遞迴
+        # 1. 保存原始函數，避免無限遞迴
         _real_hub_load = torch.hub.load
+        _real_load_url = torch.hub.load_state_dict_from_url # [Fix] 保存原始 URL 載入函數
         
-        # 定義 Mock 函數：攔截 MegaLoc 和其依賴的 DINOv2
+        # 2. 定義 Mock 函數：攔截 Repo 下載請求 (MegaLoc / DINOv2)
         def mock_hub_load(repo_or_dir, *args, **kwargs):
             # 1. 攔截 MegaLoc
             if repo_or_dir == "gmberton/MegaLoc" and MEGALOC_REPO.exists():
@@ -75,10 +76,21 @@ class LocalizationEngine:
             # 其他模型則維持原樣
             return _real_hub_load(repo_or_dir, *args, **kwargs)
 
-        # 定義 Mock 函數：攔截 SuperPoint 的權重下載請求
-        def mock_load_url(url, model_dir=None, map_location=None, progress=True, check_hash=False, file_name=None):
-            print(f"  [Offline] Intercepted URL download, loading local SuperPoint: {SUPERPOINT_WEIGHTS}")
-            return torch.load(SUPERPOINT_WEIGHTS, map_location=self.device)
+        # 3. 定義 Mock 函數：攔截權重下載請求
+        def mock_load_url(url, *args, **kwargs):
+            # [Fix] 增加判斷邏輯，只攔截 SuperPoint 的權重
+            url_str = str(url).lower()
+            if "superpoint" in url_str:
+                print(f"  [Offline] Intercepted SuperPoint weights URL, loading local: {SUPERPOINT_WEIGHTS}")
+                # 注意：這裡假設 SUPERPOINT_WEIGHTS 存在，若不存在可能需要錯誤處理
+                if SUPERPOINT_WEIGHTS.exists():
+                    return torch.load(SUPERPOINT_WEIGHTS, map_location=self.device)
+                else:
+                     print(f"  [Error] Local SuperPoint weights not found at {SUPERPOINT_WEIGHTS}")
+            
+            # 對於 MegaLoc 或其他模型，放行讓它去讀 Cache (原本的 load_state_dict_from_url 會自動查 cache)
+            # print(f"  [Offline] Passing through weight load: {url}") # Debug 用
+            return _real_load_url(url, *args, **kwargs)
 
         # 同時套用兩個 Patch
         with patch('torch.hub.load', side_effect=mock_hub_load), \
