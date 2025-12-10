@@ -7,6 +7,7 @@ import pycolmap
 import json
 from pathlib import Path
 from scipy.spatial.transform import Rotation
+from unittest.mock import patch  # [Offline Fix] 唯一需要的額外 import
 
 # HLOC Imports
 from hloc import extractors, matchers, extract_features, match_features
@@ -33,24 +34,70 @@ class LocalizationEngine:
                         self.config[k.strip()] = v.strip().strip('"').strip("'")
         
         self.global_conf_name = self.config.get("GLOBAL_CONF", "netvlad")
-        # [Align] Default FOV 調整為 69.4 以對齊 HLOC 預設值
         self.default_fov = float(self.config.get("FOV_QUERY", self.config.get("FOV", 69.4)))
         print(f"[Init] Default Query FOV: {self.default_fov}")
 
         self.project_root = project_root
         
-        print("[Init] Loading Neural Network Models...")
-        local_conf = extract_features.confs['superpoint_aachen']
-        ModelLocal = dynamic_load(extractors, local_conf['model']['name'])
-        self.model_extract_local = ModelLocal(local_conf['model']).eval().to(self.device)
+        # =========================================================================
+        # [Offline Fix] 設定離線模型路徑
+        # =========================================================================
+        # 請確認您的路徑是否正確
+        CACHE_ROOT = Path("/root/.cache/torch/hub")
+        SUPERPOINT_WEIGHTS = CACHE_ROOT / "checkpoints/superpoint_lightglue_v0-1_arxiv.pth"
         
-        global_conf = extract_features.confs[self.global_conf_name]
-        ModelGlobal = dynamic_load(extractors, global_conf['model']['name'])
-        self.model_extract_global = ModelGlobal(global_conf['model']).eval().to(self.device)
+        # 設定 GitHub Repo 的本地快取路徑
+        MEGALOC_REPO = CACHE_ROOT / "gmberton_MegaLoc_main" 
+        DINOV2_REPO = CACHE_ROOT / "facebookresearch_dinov2_main" 
+
+        print("[Init] Loading Neural Network Models (Offline Mode)...")
+
+        # 保存原始函數，避免無限遞迴
+        _real_hub_load = torch.hub.load
         
-        matcher_conf = match_features.confs['superpoint+lightglue']
-        ModelMatcher = dynamic_load(matchers, matcher_conf['model']['name'])
-        self.model_matcher = ModelMatcher(matcher_conf['model']).eval().to(self.device)
+        # 定義 Mock 函數：攔截 MegaLoc 和其依賴的 DINOv2
+        def mock_hub_load(repo_or_dir, *args, **kwargs):
+            # 1. 攔截 MegaLoc
+            if repo_or_dir == "gmberton/MegaLoc" and MEGALOC_REPO.exists():
+                print(f"  [Offline] Redirecting MegaLoc to local repo: {MEGALOC_REPO}")
+                kwargs['source'] = 'local'
+                return _real_hub_load(str(MEGALOC_REPO), *args, **kwargs)
+            
+            # 2. 攔截 DINOv2 (MegaLoc 內部會呼叫這個)
+            elif repo_or_dir == "facebookresearch/dinov2":
+                if DINOV2_REPO.exists():
+                    print(f"  [Offline] Redirecting DINOv2 to local repo: {DINOV2_REPO}")
+                    kwargs['source'] = 'local'
+                    return _real_hub_load(str(DINOV2_REPO), *args, **kwargs)
+                else:
+                    print(f"  [Warn] DINOv2 local repo not found at {DINOV2_REPO}, it might try to connect online.")
+
+            # 其他模型則維持原樣
+            return _real_hub_load(repo_or_dir, *args, **kwargs)
+
+        # 定義 Mock 函數：攔截 SuperPoint 的權重下載請求
+        def mock_load_url(url, model_dir=None, map_location=None, progress=True, check_hash=False, file_name=None):
+            print(f"  [Offline] Intercepted URL download, loading local SuperPoint: {SUPERPOINT_WEIGHTS}")
+            return torch.load(SUPERPOINT_WEIGHTS, map_location=self.device)
+
+        # 同時套用兩個 Patch
+        with patch('torch.hub.load', side_effect=mock_hub_load), \
+             patch('torch.hub.load_state_dict_from_url', side_effect=mock_load_url):
+            
+            # 1. Load Local Feature (SuperPoint)
+            local_conf = extract_features.confs['superpoint_aachen']
+            ModelLocal = dynamic_load(extractors, local_conf['model']['name'])
+            self.model_extract_local = ModelLocal(local_conf['model']).eval().to(self.device)
+            
+            # 2. Load Global Feature (MegaLoc / NetVLAD)
+            global_conf = extract_features.confs[self.global_conf_name]
+            ModelGlobal = dynamic_load(extractors, global_conf['model']['name'])
+            self.model_extract_global = ModelGlobal(global_conf['model']).eval().to(self.device)
+            
+            # 3. Load Matcher (LightGlue)
+            matcher_conf = match_features.confs['superpoint+lightglue']
+            ModelMatcher = dynamic_load(matchers, matcher_conf['model']['name'])
+            self.model_matcher = ModelMatcher(matcher_conf['model']).eval().to(self.device)
         
         target_outputs = outputs_dir if outputs_dir else (project_root / "outputs-hloc")
         self.blocks = {}
@@ -125,9 +172,7 @@ class LocalizationEngine:
         
         if max(h_orig, w_orig) >= resize_max:
             scale = resize_max / max(h_orig, w_orig)
-            # [Fix 1] 使用 round() 對齊 HLOC 的縮放邏輯
             new_w, new_h = int(round(w_orig * scale)), int(round(h_orig * scale))
-            # [Fix 2] 使用 INTER_AREA 提升縮圖後的特徵品質
             image_tensor = cv2.resize(image_arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
         else:
             image_tensor = image_arr
@@ -183,8 +228,6 @@ class LocalizationEngine:
             if score.item() > 0.01: candidate_blocks.append((score.item(), name, sim))
         
         candidate_blocks.sort(key=lambda x: x[0], reverse=True)
-        
-        # [Modified] 強制只取前 3 名，對齊 Original 版本邏輯
         candidate_blocks = candidate_blocks[:3]
 
         if len(candidate_blocks) > 0:
@@ -213,11 +256,7 @@ class LocalizationEngine:
             p2d_list, p3d_list = [], []
             viz_details = {}
             current_block_stats = {'matches_2d_sum': 0, 'matches_3d_sum': 0}
-            
             current_db_ranks = [] 
-            
-            # [Fix 6] De-duplication Set (Query_Idx, 3D_Point_ID)
-            # 確保同一個 2D 點對應同一個 3D 點只會被加入一次
             unique_matches = set()
 
             for rank, db_idx in enumerate(indices):
@@ -247,10 +286,7 @@ class LocalizationEngine:
                     print(f"    > Rank {rank} ({db_name}): 2D Matches = {n_2d}", end="")
                 
                 if rank < 3:
-                    current_db_ranks.append({
-                        'name': db_name,
-                        'matches_2d': n_2d
-                    })
+                    current_db_ranks.append({'name': db_name, 'matches_2d': n_2d})
 
                 if n_2d < 4: 
                     if verbose: print(" (Skipped: <4 2D)")
@@ -277,20 +313,14 @@ class LocalizationEngine:
                     if verbose: print(" (No Valid Points)")
                     continue
                 
-                # [Fix 6 cont.] 執行去重與格式轉換
                 new_p2d = []
                 new_p3d = []
-                
-                # 將特徵點轉為 numpy 以便操作
-                # kpts (N, 2) 已經還原並加上了 0.5
                 kpts_np = kpts.cpu().numpy()
                 points3D_map = block['recon'].points3D
                 
                 for q_idx, tid in zip(m_q_valid, target_ids_valid):
                     q_idx = int(q_idx)
                     tid = int(tid)
-                    
-                    # 檢查重複：(q_idx, tid) 組合
                     if (q_idx, tid) not in unique_matches:
                         unique_matches.add((q_idx, tid))
                         new_p2d.append(kpts_np[q_idx])
@@ -303,11 +333,8 @@ class LocalizationEngine:
                 p2d_list.append(np.array(new_p2d, dtype=np.float64))
                 p3d_list.append(np.array(new_p3d, dtype=np.float64))
                 
-                if verbose: 
-                    print(f", 3D Points = {len(new_p2d)} (Unique) -> Added")
-                
-                if rank == 0:
-                    viz_details['matched_db_name'] = db_name
+                if verbose: print(f", 3D Points = {len(new_p2d)} (Unique) -> Added")
+                if rank == 0: viz_details['matched_db_name'] = db_name
 
             if block_name == diag['top1_block']:
                  best_fail_stats['num_matches_2d'] = current_block_stats['matches_2d_sum']
@@ -326,7 +353,6 @@ class LocalizationEngine:
                 print(f"    [PnP Input] Total 2D-3D Correspondences: {len(p2d_concat)}")
             
             try:
-                # [Fix 5] 強制啟用 PnP 優化
                 refine_opts = pycolmap.AbsolutePoseRefinementOptions()
                 refine_opts.refine_focal_length = True
                 refine_opts.refine_extra_params = False
@@ -356,7 +382,6 @@ class LocalizationEngine:
                             elif ret_ransac.num_inliers > 0: success = True
                             if success: ret = ret_ransac 
 
-                    # [Fix 7] 信心閾值過濾 (防止偽陽性)
                     if success and num_inliers < 15:
                         success = False
                         if verbose: print(f"    [Filter] Low inliers ({num_inliers} < 15), marking as Failed.")
@@ -405,19 +430,15 @@ class LocalizationEngine:
         if valid_block_results:
             valid_block_results.sort(key=lambda x: x['inliers'], reverse=True)
             best_result = valid_block_results[0]
-            
-            # [新增] 擷取第二名的 PnP 結果，用於計算 Inlier Gap
             if len(valid_block_results) > 1:
                 second = valid_block_results[1]
                 best_result['diagnosis']['second_inliers'] = second['inliers']
                 best_result['diagnosis']['second_block'] = second['block']
             else:
-                # 只有一個候選者成功 PnP
                 best_result['diagnosis']['second_inliers'] = 0
                 best_result['diagnosis']['second_block'] = "None"
         else:
             best_result = {'success': False, 'inliers': 0, 'diagnosis': best_fail_stats}
-            # 失敗時也要補上預設值，避免 Key Error
             best_result['diagnosis']['second_inliers'] = 0
             best_result['diagnosis']['second_block'] = "None"
             
