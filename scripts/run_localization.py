@@ -6,7 +6,6 @@ import cv2
 import matplotlib.pyplot as plt
 import csv
 from pathlib import Path
-from collections import Counter
 
 # [Plan A] Setup path to find 'lib'
 current_dir = Path(__file__).resolve().parent
@@ -14,13 +13,13 @@ project_root = current_dir.parent
 sys.path.append(str(project_root))
 
 from lib.localization_engine import LocalizationEngine
-# [New] Import 3D visualization tool
 try:
     from scripts import visualize_sfm_open3d
 except ImportError:
     import visualize_sfm_open3d
 
 def draw_matches(query_img, db_img_path, kpts_q, kpts_db, matches, out_path):
+    # (省略 draw_matches 內容，保持不變)
     try:
         if not Path(db_img_path).exists():
             print(f"  [Viz] DB image not found: {db_img_path}"); return
@@ -49,47 +48,52 @@ def draw_matches(query_img, db_img_path, kpts_q, kpts_db, matches, out_path):
     except Exception as e: print(f"  [Viz Error] {e}")
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--query_dir", type=Path, required=True)
-    parser.add_argument("--reference", type=Path, help="Path to hloc outputs root")
-    parser.add_argument("--fov", type=float, default=None)
-    parser.add_argument("--output", type=Path, default="offline_results.txt")
+    parser = argparse.ArgumentParser(description="Offline Localization Tool")
+    parser.add_argument("query_dir", type=Path, help="Directory containing query images")
+    parser.add_argument("reference_dir", type=Path, help="Path to reference hloc models")
+    parser.add_argument("--fov", type=float, default=None, help="Camera field of view (deg)")
+    parser.add_argument("--output", type=Path, default="offline_results.txt", help="Output poses file")
     parser.add_argument("--report", type=Path, default="diagnosis_report.csv", help="Output diagnosis CSV report")
     parser.add_argument("--viz", action="store_true", help="Visualize both 2D matches and 3D point cloud")
-    parser.add_argument("--verbose", action="store_true", help="Enable detailed logging from localization engine")
+    parser.add_argument("--verbose", action="store_true", help="Enable detailed logging")
     args = parser.parse_args()
 
     engine = LocalizationEngine(
         project_root=project_root,
         config_path=project_root / "project_config.env",
         anchors_path=project_root / "anchors.json",
-        outputs_dir=args.reference
+        outputs_dir=args.reference_dir 
     )
     
     fov = args.fov if args.fov else engine.default_fov
     print(f"=== Starting Offline Localization (FOV={fov}) ===")
+    
+    if not args.query_dir.exists():
+        print(f"[Error] Query directory not found: {args.query_dir}")
+        sys.exit(1)
+
     query_files = sorted([p for p in args.query_dir.glob("*") if p.is_file() and p.suffix.lower() in {'.jpg','.png','.jpeg'}])
     
-    # Setup Viz Directories
     viz_dir_2d = args.query_dir.parent / "viz_offline"
     viz_dir_3d = args.query_dir.parent / "viz_3d"
-    if args.viz: 
-        viz_dir_2d.mkdir(exist_ok=True, parents=True)
+    if args.viz: viz_dir_2d.mkdir(exist_ok=True, parents=True)
 
     results_lines = []
-    success_blocks = [] # Track which blocks were matched
+    success_blocks = [] 
     success_count = 0
     
-    # Initialize CSV Report
+    # [New] Enhanced CSV Header (Renamed PnP Columns)
     print(f"[Info] Diagnosis report will be saved to: {args.report}")
     csv_file = open(args.report, 'w', newline='')
     csv_writer = csv.writer(csv_file)
     csv_header = [
         "ImageName", "Status", 
-        "Selected_Block", "PnP_Inliers",
-        "Second_Block", "Second_Inliers",  # <--- [新增] 這兩欄
-        "Top1_Block", "Top1_Score", 
-        "Top2_Block", "Top2_Score",
+        "PnP_Top1_Block", "PnP_Top1_Inliers", # Selected -> PnP_Top1
+        "PnP_Top2_Block", "PnP_Top2_Inliers", 
+        "PnP_Top3_Block", "PnP_Top3_Inliers", 
+        "Retrieval_Top1", "Retrieval_Score1", 
+        "Retrieval_Top2", "Retrieval_Score2", 
+        "Retrieval_Top3", "Retrieval_Score3", 
         "R1_Name", "R1_Match",
         "R2_Name", "R2_Match",
         "R3_Name", "R3_Match",
@@ -99,7 +103,6 @@ def main():
 
     for q_path in query_files:
         print(f"Processing {q_path.name}...", end=" ", flush=True)
-        # 若 verbose 開啟，換行以免 Log 擠在一起
         if args.verbose: print("") 
 
         img = cv2.imread(str(q_path))
@@ -108,32 +111,36 @@ def main():
         
         ret = engine.localize(img, fov_deg=fov, return_details=args.viz, verbose=args.verbose)
         
-        # Extract Diagnosis Data
         diag = ret.get('diagnosis', {})
         ranks = diag.get('db_ranks', [])
         while len(ranks) < 3: ranks.append({'name': 'None', 'matches_2d': 0})
         
-        # Determine the owner block for these ranks
-        rank_owner = diag.get('selected_block')
+        # rank_owner 邏輯更新 (使用 pnp_top1_block)
+        rank_owner = diag.get('pnp_top1_block')
         if rank_owner == 'None' or not rank_owner:
-            rank_owner = diag.get('top1_block', 'None')
+            rank_owner = diag.get('retrieval_top1', 'None')
             
         def fmt_rank_name(name):
             if name == 'None': return 'None'
             return f"{rank_owner}/{name}"
 
-        # Write to CSV
+        # [New] Write Enhanced Row (Using pnp_topX keys)
         row = [
             q_path.name,
             diag.get('status', 'Unknown'),
-            diag.get('selected_block', 'None'),
-            diag.get('pnp_inliers', 0),
-            diag.get('second_block', 'None'),
-            diag.get('second_inliers', 0),
-            diag.get('top1_block', 'None'),
-            f"{diag.get('top1_score', 0.0):.4f}",
-            diag.get('top2_block', 'None'),
-            f"{diag.get('top2_score', 0.0):.4f}",
+            diag.get('pnp_top1_block', 'None'),
+            diag.get('pnp_top1_inliers', 0),
+            diag.get('pnp_top2_block', 'None'),
+            diag.get('pnp_top2_inliers', 0),
+            diag.get('pnp_top3_block', 'None'),
+            diag.get('pnp_top3_inliers', 0),
+            
+            diag.get('retrieval_top1', 'None'),
+            f"{diag.get('retrieval_score1', 0.0):.4f}",
+            diag.get('retrieval_top2', 'None'),
+            f"{diag.get('retrieval_score2', 0.0):.4f}",
+            diag.get('retrieval_top3', 'None'),
+            f"{diag.get('retrieval_score3', 0.0):.4f}",
             
             fmt_rank_name(ranks[0]['name']), ranks[0]['matches_2d'],
             fmt_rank_name(ranks[1]['name']), ranks[1]['matches_2d'],
@@ -151,21 +158,17 @@ def main():
                 print(f"  ✅ [Result] Block: {ret['block']} ({ret['inliers']} inliers)")
             else:
                 print(f"✅ Block: {ret['block']} ({ret['inliers']} inliers)")
-            
             success_count += 1
             success_blocks.append(ret['block'])
-            
             qvec, tvec = ret['pose']['qvec'], ret['pose']['tvec']
             line = f"{q_path.name} {qvec[0]} {qvec[1]} {qvec[2]} {qvec[3]} {tvec[0]} {tvec[1]} {tvec[2]} {ret['block']}"
             results_lines.append(line)
-            
             if args.viz and 'matches' in ret:
                 draw_matches(img, ret['db_image_path'], ret['kpts_query'], ret['kpts_db'], ret['matches'], viz_dir_2d / f"{q_path.stem}_matches.jpg")
         else:
             status = diag.get('status', 'Failed')
-            top1 = diag.get('top1_block', 'None')
-            score = diag.get('top1_score', 0.0)
-            
+            top1 = diag.get('retrieval_top1', 'None')
+            score = diag.get('retrieval_score1', 0.0)
             r1_name = fmt_rank_name(ranks[0]['name'])
             r1_m = ranks[0]['matches_2d']
             print(f"❌ {status} (Top1: {top1}, Score: {score:.2f}) -> BestDB: {r1_name} ({r1_m} matches)")
@@ -182,18 +185,14 @@ def main():
     if args.viz and success_count > 0:
         print("\n=== Generating 3D Visualizations ===")
         unique_blocks = set(success_blocks)
-        
         for block_name in unique_blocks:
             print(f"[Viz] Processing Block: {block_name}...")
-            
-            ref_root = args.reference if args.reference else (project_root / "outputs-hloc")
+            ref_root = args.reference_dir 
             sfm_path = ref_root / block_name / "sfm_aligned"
             if not (sfm_path / "images.bin").exists():
                  sfm_path = ref_root / block_name / "sfm"
-            
             block_viz_dir = viz_dir_3d / block_name
             block_viz_dir.mkdir(parents=True, exist_ok=True)
-            
             try:
                 visualize_sfm_open3d.main(
                     sfm_dir=str(sfm_path),

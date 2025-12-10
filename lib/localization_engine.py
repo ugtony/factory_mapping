@@ -7,17 +7,15 @@ import pycolmap
 import json
 from pathlib import Path
 from scipy.spatial.transform import Rotation
-from unittest.mock import patch  # [Offline Fix] 唯一需要的額外 import
+from unittest.mock import patch
 
 # HLOC Imports
 from hloc import extractors, matchers, extract_features, match_features
 from hloc.utils.base_model import dynamic_load
 
-# [Clean Import] Relative import within the package
 try:
     from .map_utils import compute_sim2_transform
 except ImportError:
-    # Fallback if executed as script
     from map_utils import compute_sim2_transform
 
 class LocalizationEngine:
@@ -39,74 +37,48 @@ class LocalizationEngine:
 
         self.project_root = project_root
         
-        # =========================================================================
         # [Offline Fix] 設定離線模型路徑
-        # =========================================================================
-        # 請確認您的路徑是否正確
         CACHE_ROOT = Path("/root/.cache/torch/hub")
         SUPERPOINT_WEIGHTS = CACHE_ROOT / "checkpoints/superpoint_lightglue_v0-1_arxiv.pth"
-        
-        # 設定 GitHub Repo 的本地快取路徑
         MEGALOC_REPO = CACHE_ROOT / "gmberton_MegaLoc_main" 
         DINOV2_REPO = CACHE_ROOT / "facebookresearch_dinov2_main" 
 
         print("[Init] Loading Neural Network Models (Offline Mode)...")
 
-        # 1. 保存原始函數，避免無限遞迴
         _real_hub_load = torch.hub.load
-        _real_load_url = torch.hub.load_state_dict_from_url # [Fix] 保存原始 URL 載入函數
+        _real_load_url = torch.hub.load_state_dict_from_url
         
-        # 2. 定義 Mock 函數：攔截 Repo 下載請求 (MegaLoc / DINOv2)
         def mock_hub_load(repo_or_dir, *args, **kwargs):
-            # 1. 攔截 MegaLoc
             if repo_or_dir == "gmberton/MegaLoc" and MEGALOC_REPO.exists():
                 print(f"  [Offline] Redirecting MegaLoc to local repo: {MEGALOC_REPO}")
                 kwargs['source'] = 'local'
                 return _real_hub_load(str(MEGALOC_REPO), *args, **kwargs)
-            
-            # 2. 攔截 DINOv2 (MegaLoc 內部會呼叫這個)
             elif repo_or_dir == "facebookresearch/dinov2":
                 if DINOV2_REPO.exists():
                     print(f"  [Offline] Redirecting DINOv2 to local repo: {DINOV2_REPO}")
                     kwargs['source'] = 'local'
                     return _real_hub_load(str(DINOV2_REPO), *args, **kwargs)
-                else:
-                    print(f"  [Warn] DINOv2 local repo not found at {DINOV2_REPO}, it might try to connect online.")
-
-            # 其他模型則維持原樣
             return _real_hub_load(repo_or_dir, *args, **kwargs)
 
-        # 3. 定義 Mock 函數：攔截權重下載請求
         def mock_load_url(url, *args, **kwargs):
-            # [Fix] 增加判斷邏輯，只攔截 SuperPoint 的權重
             url_str = str(url).lower()
             if "superpoint" in url_str:
                 print(f"  [Offline] Intercepted SuperPoint weights URL, loading local: {SUPERPOINT_WEIGHTS}")
-                # 注意：這裡假設 SUPERPOINT_WEIGHTS 存在，若不存在可能需要錯誤處理
                 if SUPERPOINT_WEIGHTS.exists():
                     return torch.load(SUPERPOINT_WEIGHTS, map_location=self.device)
-                else:
-                     print(f"  [Error] Local SuperPoint weights not found at {SUPERPOINT_WEIGHTS}")
-            
-            # 對於 MegaLoc 或其他模型，放行讓它去讀 Cache (原本的 load_state_dict_from_url 會自動查 cache)
-            # print(f"  [Offline] Passing through weight load: {url}") # Debug 用
             return _real_load_url(url, *args, **kwargs)
 
-        # 同時套用兩個 Patch
         with patch('torch.hub.load', side_effect=mock_hub_load), \
              patch('torch.hub.load_state_dict_from_url', side_effect=mock_load_url):
             
-            # 1. Load Local Feature (SuperPoint)
             local_conf = extract_features.confs['superpoint_aachen']
             ModelLocal = dynamic_load(extractors, local_conf['model']['name'])
             self.model_extract_local = ModelLocal(local_conf['model']).eval().to(self.device)
             
-            # 2. Load Global Feature (MegaLoc / NetVLAD)
             global_conf = extract_features.confs[self.global_conf_name]
             ModelGlobal = dynamic_load(extractors, global_conf['model']['name'])
             self.model_extract_global = ModelGlobal(global_conf['model']).eval().to(self.device)
             
-            # 3. Load Matcher (LightGlue)
             matcher_conf = match_features.confs['superpoint+lightglue']
             ModelMatcher = dynamic_load(matchers, matcher_conf['model']['name'])
             self.model_matcher = ModelMatcher(matcher_conf['model']).eval().to(self.device)
@@ -177,7 +149,6 @@ class LocalizationEngine:
         if fov_deg is None: fov_deg = self.default_fov
         
         h_orig, w_orig = image_arr.shape[:2]
-        # Resize logic...
         resize_max = 1024
         scale = 1.0
         new_w, new_h = w_orig, h_orig
@@ -206,18 +177,15 @@ class LocalizationEngine:
         if verbose:
             print(f"  [Log] Query Kpts: {len(kpts)} (Scale: {scale_x:.4f}, {scale_y:.4f})")
         
-        # [Init Diagnosis]
+        # [Init Diagnosis] (Updated keys)
         diag = {
             'num_kpts': len(kpts),
-            'top1_block': 'None', 'top1_score': 0.0,
-            'top2_block': 'None', 'top2_score': 0.0,
-            'selected_block': 'None',
-            'num_matches_2d': 0, 'num_matches_3d': 0, 'pnp_inliers': 0,
+            'pnp_top1_block': 'None', 'pnp_top1_inliers': 0, # Renamed
+            'num_matches_2d': 0, 'num_matches_3d': 0, 
             'status': 'Fail_Unknown',
             'db_ranks': [] 
         }
 
-        # [Fix 3] Coordinate Restoration (0.5 pixel offset for COLMAP)
         kpts[:, 0] = (kpts[:, 0] + 0.5) * scale_x
         kpts[:, 1] = (kpts[:, 1] + 0.5) * scale_y
         
@@ -242,12 +210,15 @@ class LocalizationEngine:
         candidate_blocks.sort(key=lambda x: x[0], reverse=True)
         candidate_blocks = candidate_blocks[:3]
 
-        if len(candidate_blocks) > 0:
-            diag['top1_block'] = candidate_blocks[0][1]
-            diag['top1_score'] = candidate_blocks[0][0]
-        if len(candidate_blocks) > 1:
-            diag['top2_block'] = candidate_blocks[1][1]
-            diag['top2_score'] = candidate_blocks[1][0]
+        # 記錄 Retrieval Top 3
+        for i in range(3):
+            rank = i + 1
+            if i < len(candidate_blocks):
+                diag[f'retrieval_top{rank}'] = candidate_blocks[i][1]
+                diag[f'retrieval_score{rank}'] = candidate_blocks[i][0]
+            else:
+                diag[f'retrieval_top{rank}'] = "None"
+                diag[f'retrieval_score{rank}'] = 0.0
 
         if not candidate_blocks:
             diag['status'] = 'Fail_No_Retrieval'
@@ -348,7 +319,7 @@ class LocalizationEngine:
                 if verbose: print(f", 3D Points = {len(new_p2d)} (Unique) -> Added")
                 if rank == 0: viz_details['matched_db_name'] = db_name
 
-            if block_name == diag['top1_block']:
+            if block_name == diag.get('retrieval_top1'):
                  best_fail_stats['num_matches_2d'] = current_block_stats['matches_2d_sum']
                  best_fail_stats['num_matches_3d'] = current_block_stats['matches_3d_sum']
                  best_fail_stats['db_ranks'] = current_db_ranks
@@ -419,10 +390,10 @@ class LocalizationEngine:
                 if success and qvec is not None:
                     res_diag = diag.copy()
                     res_diag.update({
-                        'selected_block': block_name,
+                        'pnp_top1_block': block_name,  # Renamed
+                        'pnp_top1_inliers': num_inliers, # Renamed
                         'num_matches_2d': current_block_stats['matches_2d_sum'],
                         'num_matches_3d': len(p2d_concat),
-                        'pnp_inliers': num_inliers,
                         'status': 'Success',
                         'db_ranks': current_db_ranks 
                     })
@@ -439,19 +410,33 @@ class LocalizationEngine:
             except Exception as e:
                 print(f"[Error] PnP failed for {block_name}: {e}"); continue
         
+        # [New] PnP Ranking Logic (Top 1, 2, 3)
         if valid_block_results:
             valid_block_results.sort(key=lambda x: x['inliers'], reverse=True)
             best_result = valid_block_results[0]
+            
+            # PnP 2nd Place
             if len(valid_block_results) > 1:
                 second = valid_block_results[1]
-                best_result['diagnosis']['second_inliers'] = second['inliers']
-                best_result['diagnosis']['second_block'] = second['block']
+                best_result['diagnosis']['pnp_top2_inliers'] = second['inliers']
+                best_result['diagnosis']['pnp_top2_block'] = second['block']
             else:
-                best_result['diagnosis']['second_inliers'] = 0
-                best_result['diagnosis']['second_block'] = "None"
+                best_result['diagnosis']['pnp_top2_inliers'] = 0
+                best_result['diagnosis']['pnp_top2_block'] = "None"
+            
+            # PnP 3rd Place
+            if len(valid_block_results) > 2:
+                third = valid_block_results[2]
+                best_result['diagnosis']['pnp_top3_inliers'] = third['inliers']
+                best_result['diagnosis']['pnp_top3_block'] = third['block']
+            else:
+                best_result['diagnosis']['pnp_top3_inliers'] = 0
+                best_result['diagnosis']['pnp_top3_block'] = "None"
         else:
             best_result = {'success': False, 'inliers': 0, 'diagnosis': best_fail_stats}
-            best_result['diagnosis']['second_inliers'] = 0
-            best_result['diagnosis']['second_block'] = "None"
+            # Fill empty for failed
+            for r in ['1', '2', '3']: # Fill top1, top2, top3
+                best_result['diagnosis'][f'pnp_top{r}_inliers'] = 0
+                best_result['diagnosis'][f'pnp_top{r}_block'] = "None"
             
         return best_result

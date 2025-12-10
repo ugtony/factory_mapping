@@ -93,12 +93,26 @@ def plot_results(output_png, data_points, anchors_cfg):
     print(f"🖼️  Plot saved to: {output_png}")
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--submission", type=Path, required=True)
-    parser.add_argument("--anchors", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default="submission_map.txt")
-    parser.add_argument("--plot", action="store_true")
+    parser = argparse.ArgumentParser(description="Convert localization poses to map coordinates.")
+    
+    # [Modified] submission 改為 positional argument
+    parser.add_argument("submission", type=Path, help="Path to input poses file (e.g. offline_results.txt)")
+    
+    # [Modified] anchors 預設為 ./anchors.json
+    parser.add_argument("--anchors", type=Path, default="anchors.json", help="Path to anchors.json (default: anchors.json)")
+    
+    parser.add_argument("--output", type=Path, default="submission_map.txt", help="Output mapped poses file")
+    
+    # [Modified] plot 改為預設開啟 (True)，並提供 --no-plot 關閉
+    parser.add_argument("--no-plot", action="store_false", dest="plot", help="Disable visualization plotting")
+    parser.set_defaults(plot=True)
+    
     args = parser.parse_args()
+
+    if not args.anchors.exists():
+        print(f"[Error] Anchors file not found: {args.anchors}")
+        print("Please provide correct path via --anchors or ensure anchors.json exists in current directory.")
+        return
 
     with open(args.anchors, 'r') as f: anchors_cfg = json.load(f)
     transforms = {}
