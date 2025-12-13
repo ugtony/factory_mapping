@@ -19,7 +19,6 @@ except ImportError:
     import visualize_sfm_open3d
 
 def draw_matches(query_img, db_img_path, kpts_q, kpts_db, matches, out_path):
-    # (省略 draw_matches 內容，保持不變)
     try:
         if not Path(db_img_path).exists():
             print(f"  [Viz] DB image not found: {db_img_path}"); return
@@ -54,9 +53,19 @@ def main():
     parser.add_argument("--fov", type=float, default=None, help="Camera field of view (deg)")
     parser.add_argument("--output", type=Path, default="offline_results.txt", help="Output poses file")
     parser.add_argument("--report", type=Path, default="diagnosis_report.csv", help="Output diagnosis CSV report")
+    
+    # [Modified] 改為接收單一字串，支援逗號分隔
+    parser.add_argument("--block-filter", type=str, default=None, help="Comma-separated list of blocks (e.g. brazil360,miami360)")
+    
     parser.add_argument("--viz", action="store_true", help="Visualize both 2D matches and 3D point cloud")
     parser.add_argument("--verbose", action="store_true", help="Enable detailed logging")
     args = parser.parse_args()
+
+    # [New] 解析逗號分隔字串為列表
+    filter_list = None
+    if args.block_filter:
+        # split by comma and strip whitespace
+        filter_list = [b.strip() for b in args.block_filter.split(',') if b.strip()]
 
     engine = LocalizationEngine(
         project_root=project_root,
@@ -66,7 +75,9 @@ def main():
     )
     
     fov = args.fov if args.fov else engine.default_fov
-    print(f"=== Starting Offline Localization (FOV={fov}) ===")
+    
+    filter_msg = f" (Filter: {filter_list})" if filter_list else " (All Blocks)"
+    print(f"=== Starting Offline Localization (FOV={fov}){filter_msg} ===")
     
     if not args.query_dir.exists():
         print(f"[Error] Query directory not found: {args.query_dir}")
@@ -82,13 +93,12 @@ def main():
     success_blocks = [] 
     success_count = 0
     
-    # [New] Enhanced CSV Header (Renamed PnP Columns)
     print(f"[Info] Diagnosis report will be saved to: {args.report}")
     csv_file = open(args.report, 'w', newline='')
     csv_writer = csv.writer(csv_file)
     csv_header = [
         "ImageName", "Status", 
-        "PnP_Top1_Block", "PnP_Top1_Inliers", # Selected -> PnP_Top1
+        "PnP_Top1_Block", "PnP_Top1_Inliers",
         "PnP_Top2_Block", "PnP_Top2_Inliers", 
         "PnP_Top3_Block", "PnP_Top3_Inliers", 
         "Retrieval_Top1", "Retrieval_Score1", 
@@ -109,13 +119,19 @@ def main():
         if img is None: print("[Error] Read failed"); continue
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        ret = engine.localize(img, fov_deg=fov, return_details=args.viz, verbose=args.verbose)
+        # [Modified] 傳入解析後的 filter_list
+        ret = engine.localize(
+            img, 
+            fov_deg=fov, 
+            return_details=args.viz, 
+            verbose=args.verbose, 
+            block_filter=filter_list 
+        )
         
         diag = ret.get('diagnosis', {})
         ranks = diag.get('db_ranks', [])
         while len(ranks) < 3: ranks.append({'name': 'None', 'matches_2d': 0})
         
-        # rank_owner 邏輯更新 (使用 pnp_top1_block)
         rank_owner = diag.get('pnp_top1_block')
         if rank_owner == 'None' or not rank_owner:
             rank_owner = diag.get('retrieval_top1', 'None')
@@ -124,7 +140,6 @@ def main():
             if name == 'None': return 'None'
             return f"{rank_owner}/{name}"
 
-        # [New] Write Enhanced Row (Using pnp_topX keys)
         row = [
             q_path.name,
             diag.get('status', 'Unknown'),

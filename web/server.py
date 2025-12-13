@@ -1,4 +1,5 @@
-# scripts/server.py
+# scripts/server.py (或 web/server.py)
+
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from typing import Optional, Dict, Any
@@ -42,8 +43,13 @@ class LocalizeResponse(BaseModel):
     # [New] 新增診斷欄位 (允許任意字典內容)
     diagnosis: Optional[Dict[str, Any]] = None
 
+# [Modified] 新增 block_filter 參數 (Form Data)
 @app.post("/localize", response_model=LocalizeResponse)
-async def localize_endpoint(file: UploadFile = File(...), fov: Optional[float] = Form(None)):
+async def localize_endpoint(
+    file: UploadFile = File(...), 
+    fov: Optional[float] = Form(None),
+    block_filter: Optional[str] = Form(None)
+):
     t0 = time.time()
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
@@ -51,8 +57,20 @@ async def localize_endpoint(file: UploadFile = File(...), fov: Optional[float] =
     if img is None: raise HTTPException(status_code=400, detail="Invalid image")
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    # 呼叫 Engine (return_details=False 仍會回傳 diagnosis 數據)
-    result = engine.localize(img, fov_deg=fov, return_details=False)
+    # [New] 解析逗號分隔的 block_filter 字串
+    filter_list = None
+    if block_filter:
+        filter_list = [b.strip() for b in block_filter.split(',') if b.strip()]
+        # print(f"[Server] Applying block filter: {filter_list}")
+
+    # 呼叫 Engine，傳入 block_filter
+    result = engine.localize(
+        img, 
+        fov_deg=fov, 
+        return_details=False,
+        block_filter=filter_list
+    )
+    
     dt = (time.time() - t0) * 1000
     
     # 提取診斷資訊 (若無則為空字典)
@@ -62,7 +80,7 @@ async def localize_endpoint(file: UploadFile = File(...), fov: Optional[float] =
         return {
             "status": "failed", 
             "latency_ms": dt,
-            "diagnosis": diag_data  # [New] 失敗時回傳診斷
+            "diagnosis": diag_data
         }
     
     q, t = result['pose']['qvec'], result['pose']['tvec']
@@ -88,7 +106,7 @@ async def localize_endpoint(file: UploadFile = File(...), fov: Optional[float] =
         "status": "success", "block": result['block'], "inliers": result['inliers'],
         "map_x": float(p_map[0]), "map_y": float(p_map[1]), "map_yaw": float(map_yaw),
         "latency_ms": dt,
-        "diagnosis": diag_data # [New] 成功時也回傳診斷
+        "diagnosis": diag_data
     }
 
 if __name__ == "__main__":

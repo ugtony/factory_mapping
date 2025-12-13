@@ -145,7 +145,14 @@ class LocalizationEngine:
             }
 
     @torch.no_grad()
-    def localize(self, image_arr: np.ndarray, fov_deg: float = None, return_details: bool = False, top_k_db: int = 10, verbose: bool = False):
+    def localize(self, 
+                 image_arr: np.ndarray, 
+                 fov_deg: float = None, 
+                 return_details: bool = False, 
+                 top_k_db: int = 10, 
+                 verbose: bool = False,
+                 block_filter: list = None): # [Added] block_filter parameter
+        
         if fov_deg is None: fov_deg = self.default_fov
         
         h_orig, w_orig = image_arr.shape[:2]
@@ -177,10 +184,10 @@ class LocalizationEngine:
         if verbose:
             print(f"  [Log] Query Kpts: {len(kpts)} (Scale: {scale_x:.4f}, {scale_y:.4f})")
         
-        # [Init Diagnosis] (Updated keys)
+        # [Init Diagnosis]
         diag = {
             'num_kpts': len(kpts),
-            'pnp_top1_block': 'None', 'pnp_top1_inliers': 0, # Renamed
+            'pnp_top1_block': 'None', 'pnp_top1_inliers': 0, 
             'num_matches_2d': 0, 'num_matches_3d': 0, 
             'status': 'Fail_Unknown',
             'db_ranks': [] 
@@ -198,6 +205,11 @@ class LocalizationEngine:
 
         candidate_blocks = []
         for name, block in self.blocks.items():
+            # [Added] Block Filtering
+            if block_filter is not None and name not in block_filter:
+                if verbose: print(f"  [Log] Skipping block {name} (not in filter)")
+                continue
+
             sim = torch.matmul(q_global, block['global_vecs'].t())
             k_scoring = min(5, sim.shape[1])
             if k_scoring > 0:
@@ -281,8 +293,10 @@ class LocalizationEngine:
                 valid_3d = m_db < len(p3d_ids)
                 m_q, m_db = m_q[valid_3d], m_db[valid_3d]
                 target_ids = p3d_ids[m_db]
+                
                 has_3d = target_ids != -1
-                n_3d = has_3d.sum()
+                # [Fix] 強制轉為 Python int，避免 numpy.int64 造成 Pydantic 錯誤
+                n_3d = int(has_3d.sum())
                 current_block_stats['matches_3d_sum'] += n_3d
                 
                 if n_3d < 4:
@@ -410,7 +424,7 @@ class LocalizationEngine:
             except Exception as e:
                 print(f"[Error] PnP failed for {block_name}: {e}"); continue
         
-        # [New] PnP Ranking Logic (Top 1, 2, 3)
+        # PnP Ranking Logic
         if valid_block_results:
             valid_block_results.sort(key=lambda x: x['inliers'], reverse=True)
             best_result = valid_block_results[0]
@@ -434,8 +448,7 @@ class LocalizationEngine:
                 best_result['diagnosis']['pnp_top3_block'] = "None"
         else:
             best_result = {'success': False, 'inliers': 0, 'diagnosis': best_fail_stats}
-            # Fill empty for failed
-            for r in ['1', '2', '3']: # Fill top1, top2, top3
+            for r in ['1', '2', '3']: 
                 best_result['diagnosis'][f'pnp_top{r}_inliers'] = 0
                 best_result['diagnosis'][f'pnp_top{r}_block'] = "None"
             
