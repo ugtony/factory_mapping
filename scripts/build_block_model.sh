@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# build_block_model.sh [V10-Multi-Format-FOV-Split]
+# build_block_model.sh [V12-Configurable-SeqWindow]
 # - Update: 支援更多影片格式 (mp4, mov, mkv, insv, etc.)
 # - Update: 自動偵測 raw/ 目錄並呼叫 extract_frames.sh 進行抽幀。
 # - Update: 使用 FOV_MODEL 作為建模視角
+# - New: 若 db 或 db_360 已有圖片，則自動跳過抽幀與 360 轉換步驟。
+# - New: 支援從 project_config.env 或 CLI (--seq-window) 設定 SEQ_WINDOW。
+# - Debug: set -x 開啟詳細指令輸出
 
-set -euo pipefail
+set -euox pipefail
 
 # -------- 0. 參數解析與設定檔讀取 --------
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=FLOAT] [--global-conf=STR] [--fps=FLOAT]"
+  echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=FLOAT] [--seq-window=INT] [--global-conf=STR] [--fps=FLOAT]"
   exit 1
 fi
 
@@ -25,6 +28,7 @@ DEFAULT_DENSE=0
 DEFAULT_FOV="AUTO"
 DEFAULT_GLOBAL="netvlad"
 DEFAULT_FPS=2
+DEFAULT_SEQ_WINDOW=3
 
 # 2. 嘗試載入設定檔
 if [ -f "${CONFIG_FILE}" ]; then
@@ -41,6 +45,7 @@ FOV_MODEL_VAL="${FOV_MODEL:-$DEFAULT_FOV}"
 
 GLOBAL_CONF="${GLOBAL_CONF:-$DEFAULT_GLOBAL}"
 EXTRACT_FPS="${FPS:-$DEFAULT_FPS}"
+SEQ_WINDOW_VAL="${SEQ_WINDOW:-$DEFAULT_SEQ_WINDOW}"
 
 # 4. 解析 CLI 參數
 while [ $# -gt 0 ]; do
@@ -48,6 +53,7 @@ while [ $# -gt 0 ]; do
     --mode=*) CAM_MODE="${1#*=}" ;;
     --dense)  DENSE_360=1 ;;
     --fov=*)  FOV_MODEL_VAL="${1#*=}" ;; # 允許 CLI 覆蓋 FOV
+    --seq-window=*) SEQ_WINDOW_VAL="${1#*=}" ;; # 允許 CLI 覆蓋 SEQ_WINDOW
     --fps=*)  EXTRACT_FPS="${1#*=}" ;;
     --global-conf=*|--global_conf=*|--global_model=*) GLOBAL_CONF="${1#*=}" ;;
     --global-conf|--global_conf|--global_model) GLOBAL_CONF="$2"; shift ;;
@@ -77,6 +83,7 @@ echo "========================================"
 echo "[Info] Block: ${BLOCK_NAME}"
 echo "[Info] Mode: ${CAM_MODE^^}"
 echo "[Info] Global Model: ${GLOBAL_CONF}"
+echo "[Info] Seq Window: ${SEQ_WINDOW_VAL}"
 if [ "${CAM_MODE}" = "360" ]; then
   [ "${DENSE_360}" = "1" ] && V_TYPE="Dense(8)" || V_TYPE="Sparse(4)"
   echo "[Info] 360 Settings: ${V_TYPE}, Modeling FOV=${FOV_MODEL_VAL}"
@@ -90,7 +97,7 @@ MATCHER_CONF="superpoint+lightglue"
 REBUILD_SFM="${REBUILD_SFM:-0}"
 ALIGN_SFM="${ALIGN_SFM:-1}"
 NUM_RETRIEVAL="${NUM_RETRIEVAL:-10}"
-SEQ_WINDOW="${SEQ_WINDOW:-5}"
+SEQ_WINDOW="${SEQ_WINDOW_VAL}"
 
 # -------- 3. 核心檔案路徑 --------
 DB_LIST="${OUT_DIR}/db.txt"
@@ -119,20 +126,28 @@ if [ -d "${RAW_DIR}" ]; then
   HAS_VIDEO=$(find "${RAW_DIR}" -maxdepth 1 -type f \( "${VIDEO_EXTS[@]}" \) -print -quit)
   
   if [ -n "$HAS_VIDEO" ]; then
-      echo "[-1] Found video files in raw/. Auto-extracting frames (FPS=${EXTRACT_FPS})..."
-      
       if [ "${CAM_MODE}" = "360" ]; then
           TARGET_EXT_DIR="${DATA_DIR}/db_360"
       else
           TARGET_EXT_DIR="${DATA_DIR}/db"
       fi
-      
-      bash "${EXTRACT_SCRIPT}" "${RAW_DIR}" "${TARGET_EXT_DIR}" \
-          --fps "${EXTRACT_FPS}" \
-          --prefix "frames" \
-          --ext "jpg"
-          
-      echo "     > Extraction done. Output: ${TARGET_EXT_DIR}"
+
+      # [New] 檢查目標資料夾是否已有圖片，若有則跳過
+      HAS_IMAGES=""
+      if [ -d "${TARGET_EXT_DIR}" ]; then
+          HAS_IMAGES=$(find "${TARGET_EXT_DIR}" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.png" \) -print -quit)
+      fi
+
+      if [ -n "$HAS_IMAGES" ]; then
+          echo "[-1] Found existing images in ${TARGET_EXT_DIR}. Skipping extraction."
+      else
+          echo "[-1] Found video files in raw/. Auto-extracting frames (FPS=${EXTRACT_FPS})..."
+          bash "${EXTRACT_SCRIPT}" "${RAW_DIR}" "${TARGET_EXT_DIR}" \
+              --fps "${EXTRACT_FPS}" \
+              --prefix "frames" \
+              --ext "jpg"
+          echo "     > Extraction done. Output: ${TARGET_EXT_DIR}"
+      fi
   else
       echo "[-1] raw/ directory exists but no supported video files found. Skipping extraction."
   fi
@@ -140,14 +155,25 @@ fi
 
 # -------- [Step 0] 360 前處理 --------
 if [ "${CAM_MODE}" = "360" ]; then
-  echo "[0] (360 Mode) Converting Equirectangular to Pinhole..."
   SRC_360="${DATA_DIR}/db_360"
   DST_DB="${DATA_DIR}/db"
-  if [ ! -d "${SRC_360}" ]; then echo "[Error] Missing ${SRC_360}"; exit 1; fi
-  
-  CONVERT_ARGS=( "--input_dir" "${SRC_360}" "--output_dir" "${DST_DB}" "--fov" "${FOV_MODEL_VAL}" )
-  if [ "${DENSE_360}" = "1" ]; then CONVERT_ARGS+=( "--dense" ); fi
-  "${PY}" "${CONVERT_360_SCRIPT}" "${CONVERT_ARGS[@]}"
+
+  # [New] 檢查目標資料夾是否已有圖片，若有則跳過
+  HAS_DB_IMAGES=""
+  if [ -d "${DST_DB}" ]; then
+      HAS_DB_IMAGES=$(find "${DST_DB}" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.png" \) -print -quit)
+  fi
+
+  if [ -n "$HAS_DB_IMAGES" ]; then
+      echo "[0] (360 Mode) Target DB ${DST_DB} is not empty. Skipping Pinhole conversion."
+  else
+      echo "[0] (360 Mode) Converting Equirectangular to Pinhole..."
+      if [ ! -d "${SRC_360}" ]; then echo "[Error] Missing ${SRC_360}"; exit 1; fi
+      
+      CONVERT_ARGS=( "--input_dir" "${SRC_360}" "--output_dir" "${DST_DB}" "--fov" "${FOV_MODEL_VAL}" )
+      if [ "${DENSE_360}" = "1" ]; then CONVERT_ARGS+=( "--dense" ); fi
+      "${PY}" "${CONVERT_360_SCRIPT}" "${CONVERT_ARGS[@]}"
+  fi
 fi
 
 # -------- HLOC Pipeline --------
