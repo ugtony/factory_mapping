@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Factory Street View - Web</title>
+    <style>
+        body { margin: 0; display: flex; height: 100vh; font-family: sans-serif; overflow: hidden; }
+        #left-panel { width: 50%; height: 100%; border-right: 2px solid #ccc; position: relative; background: #f0f0f0; }
+        #right-panel { width: 50%; height: 100%; background: #000; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+        #mapCanvas { width: 100%; height: 100%; cursor: crosshair; display: block; }
+        #streetViewImg { max-width: 100%; max-height: 90%; object-fit: contain; }
+        #info-box { position: absolute; top: 10px; left: 10px; background: rgba(255,255,255,0.8); padding: 5px 10px; border-radius: 4px; pointer-events: none; user-select: none; z-index: 100; }
+        #controls-hint { font-size: 13px; color: #333; line-height: 1.5; }
+        #img-info { color: white; margin-top: 10px; font-size: 16px; }
+        .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 20px; color: #666; }
+    </style>
+</head>
+<body>
+
+<div id="left-panel">
+    <div id="loadingMsg" class="loading">Loading Map Data...</div>
+    <canvas id="mapCanvas"></canvas>
+    <div id="info-box">
+        <strong>Controls:</strong><br>
+        <div id="controls-hint">
+        • Wheel: Zoom In/Out<br>
+        • Right Drag: Pan Map<br>
+        • Left Drag: Rotate View<br>
+        • Double Click: Move
+        </div>
+    </div>
+</div>
+
+<div id="right-panel">
+    <img id="streetViewImg" src="" alt="Select a location">
+    <div id="img-info">Waiting for selection...</div>
+</div>
+
+<script>
+    const canvas = document.getElementById('mapCanvas');
+    const ctx = canvas.getContext('2d');
+    const imgElement = document.getElementById('streetViewImg');
+    const imgInfo = document.getElementById('img-info');
+    
+    let config = {};
+    let cameras = [];
+    let scenePoints = [];
+    let blockLabels = [];
+    let currentCamIdx = 0;
+    let anchorIdx = 0;
+    
+    // Interaction States
+    let isRotating = false; 
+    let isPanning = false;  
+    let panStart = { x: 0, y: 0 };
+    let targetYaw = null;
+    let isProcessingRotate = false;
+
+    // Viewport State
+    let viewport = {
+        scale: 1, offsetX: 0, offsetY: 0,    
+        baseScale: 1, minX: 0, minY: 0, canvasH: 0 
+    };
+
+    async function init() {
+        console.log("Fetching init data...");
+        try {
+            const res = await fetch('/api/init_data');
+            const data = await res.json();
+            config = data.config;
+            cameras = data.cameras;
+            blockLabels = data.block_labels;
+            
+            console.log(`Loaded ${cameras.length} cameras.`);
+
+            // Setup Canvas size
+            setupCanvas();
+            
+            // Calculate initial fit
+            fitMapToScreen();
+            
+            document.getElementById('loadingMsg').style.display = 'none';
+            
+            // [Fix] Force select the first camera if available
+            if (cameras.length > 0) {
+                console.log("Selecting initial camera: 0");
+                updateView(0);
+                anchorIdx = 0;
+            } else {
+                console.warn("No cameras loaded!");
+            }
+
+            drawLoop();
+
+            // Load points in background
+            fetch('/api/scene_points').then(r => r.json()).then(pts => {
+                scenePoints = pts;
+                drawLoop();
+            });
+
+            // [Fix] Double-check layout after a short delay to fix misalignment
+            setTimeout(() => {
+                setupCanvas();
+                fitMapToScreen();
+                drawLoop();
+            }, 100);
+
+        } catch (e) {
+            console.error("Init failed:", e);
+            document.getElementById('loadingMsg').innerText = "Error loading data.";
+        }
+    }
+
+    function setupCanvas() {
+        const lp = document.getElementById('left-panel');
+        if (canvas.width !== lp.clientWidth || canvas.height !== lp.clientHeight) {
+            canvas.width = lp.clientWidth;
+            canvas.height = lp.clientHeight;
+            viewport.canvasH = canvas.height;
+        }
+    }
+
+    function fitMapToScreen() {
+        if (!config.map_bounds) return;
+        const [minX, maxX, minY, maxY] = config.map_bounds;
+        const mapW = maxX - minX;
+        const mapH = maxY - minY;
+        
+        // Prevent division by zero
+        if (mapW === 0 || mapH === 0) return;
+
+        const scaleX = canvas.width / mapW;
+        const scaleY = canvas.height / mapH;
+        const baseScale = Math.min(scaleX, scaleY) * 0.9; 
+        
+        viewport.baseScale = baseScale;
+        viewport.scale = baseScale;
+        viewport.minX = minX;
+        viewport.minY = minY;
+        
+        const pxW = mapW * baseScale;
+        const pxH = mapH * baseScale;
+        viewport.offsetX = (canvas.width - pxW) / 2;
+        viewport.offsetY = (canvas.height - pxH) / 2;
+    }
+
+    function worldToScreen(wx, wy) {
+        const relX = (wx - viewport.minX);
+        const relY = (wy - viewport.minY);
+        const sx = relX * viewport.scale + viewport.offsetX;
+        const sy = canvas.height - (relY * viewport.scale + viewport.offsetY);
+        return { x: sx, y: sy };
+    }
+
+    function screenToWorld(sx, sy) {
+        const wx = (sx - viewport.offsetX) / viewport.scale + viewport.minX;
+        const wy = (canvas.height - sy - viewport.offsetY) / viewport.scale + viewport.minY;
+        return { x: wx, y: wy };
+    }
+
+    function drawArrow(ctx, fromX, fromY, angle, length, color, width) {
+        const toX = fromX + Math.cos(angle) * length;
+        const toY = fromY - Math.sin(angle) * length; 
+        ctx.beginPath();
+        ctx.moveTo(fromX, fromY);
+        ctx.lineTo(toX, toY);
+        ctx.lineWidth = width;
+        ctx.strokeStyle = color;
+        ctx.stroke();
+    }
+
+    function drawWedge(ctx, x, y, angle, radius, color) {
+        const fov = 60 * Math.PI / 180;
+        const startAngle = -angle - fov / 2;
+        const endAngle = -angle + fov / 2;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.arc(x, y, radius, startAngle, endAngle);
+        ctx.closePath();
+        ctx.fillStyle = color;
+        ctx.fill();
+    }
+
+    function drawLoop() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (!viewport.scale) return;
+
+        // 1. Scene (修改這裡！)
+        // 原本是 '#ddd', 改深一點變成 '#666' 或 '#444'
+        ctx.fillStyle = '#AAA'; 
+        
+        for (let p of scenePoints) {
+            const s = worldToScreen(p.x, p.y);
+            // Only draw if within bounds (Optimization)
+            if (s.x > 0 && s.x < canvas.width && s.y > 0 && s.y < canvas.height) {
+                // 原本是 fillRect(s.x, s.y, 1, 1), 改大一點變成 2, 2
+                ctx.fillRect(s.x, s.y, 2, 2);
+            }
+        }
+
+        // Cameras
+        const arrowLen = config.visual_scale * viewport.scale * 0.8;
+        for (let cam of cameras) {
+            const s = worldToScreen(cam.x, cam.y);
+            // Culling
+            if (s.x < -50 || s.x > canvas.width+50 || s.y < -50 || s.y > canvas.height+50) continue;
+
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, 3, 0, 2 * Math.PI);
+            ctx.fillStyle = cam.color;
+            ctx.fill();
+            drawArrow(ctx, s.x, s.y, cam.yaw, arrowLen, cam.color, 1);
+        }
+
+        // Labels
+        ctx.font = "bold 14px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        for (let label of blockLabels) {
+            const s = worldToScreen(label.x, label.y);
+            if (s.x < -100 || s.x > canvas.width+100 || s.y < -50 || s.y > canvas.height+50) continue;
+
+            const text = label.name;
+            const metrics = ctx.measureText(text);
+            const w = metrics.width + 12;
+            const h = 24;
+            
+            ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+            ctx.fillRect(s.x - w/2, s.y - h/2, w, h);
+            ctx.strokeStyle = "#333";
+            ctx.lineWidth = 1;
+            ctx.strokeRect(s.x - w/2, s.y - h/2, w, h);
+            ctx.fillStyle = "#000";
+            ctx.fillText(text, s.x, s.y);
+        }
+
+        // Indicators
+        if (cameras.length > 0) {
+            const curCam = cameras[currentCamIdx];
+            const s = worldToScreen(curCam.x, curCam.y);
+            
+            const mapW = config.map_bounds[1] - config.map_bounds[0];
+            const baseSizeMap = mapW * 0.03 * viewport.scale;
+            const baseSizeStep = arrowLen * 3.0;
+            const wedgeR = Math.max(baseSizeMap, baseSizeStep);
+            
+            ctx.globalAlpha = 0.5;
+            drawWedge(ctx, s.x, s.y, curCam.yaw, wedgeR, 'blue');
+            ctx.globalAlpha = 1.0;
+
+            if (isRotating && targetYaw !== null) {
+                const anchor = cameras[anchorIdx];
+                const sa = worldToScreen(anchor.x, anchor.y);
+                ctx.globalAlpha = 0.4;
+                drawWedge(ctx, sa.x, sa.y, targetYaw, wedgeR * 1.2, 'green');
+                ctx.globalAlpha = 1.0;
+            }
+        }
+    }
+
+    // --- Interaction Logic ---
+    function updateView(idx) {
+        if (idx < 0 || idx >= cameras.length) return;
+        currentCamIdx = idx;
+        const cam = cameras[idx];
+        
+        console.log(`Switching to camera ${idx}: [${cam.block}] ${cam.name}`);
+        
+        // Update Image Source
+        imgElement.onload = () => { console.log("Image loaded successfully"); };
+        imgElement.onerror = () => { 
+            console.error("Failed to load image"); 
+            imgInfo.innerText += " (Load Failed)";
+        };
+        imgElement.src = `/api/image/${idx}`;
+        imgInfo.innerText = `[${cam.block}] ${cam.name}`;
+        
+        drawLoop();
+    }
+
+    // --- Event Listeners ---
+    canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const zoomIntensity = 0.1;
+        const wheel = e.deltaY < 0 ? 1 : -1;
+        const zoomFactor = Math.exp(wheel * zoomIntensity);
+        
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+
+        const wx_rel = (mx - viewport.offsetX) / viewport.scale;
+        const wy_rel = (canvas.height - my - viewport.offsetY) / viewport.scale;
+
+        const newScale = viewport.scale * zoomFactor;
+        
+        viewport.offsetX = mx - wx_rel * newScale;
+        viewport.offsetY = canvas.height - my - wy_rel * newScale;
+        viewport.scale = newScale;
+        drawLoop();
+    });
+
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+    canvas.addEventListener('mousedown', (e) => {
+        if (e.button === 0) { 
+            isRotating = true;
+            anchorIdx = currentCamIdx;
+            canvas.style.cursor = 'crosshair';
+        } else if (e.button === 2) { 
+            isPanning = true;
+            panStart = { x: e.clientX, y: e.clientY };
+            canvas.style.cursor = 'grab';
+        }
+    });
+
+    window.addEventListener('mouseup', () => {
+        isRotating = false;
+        isPanning = false;
+        isProcessingRotate = false; 
+        targetYaw = null;
+        canvas.style.cursor = 'crosshair';
+        drawLoop();
+    });
+
+    canvas.addEventListener('mousemove', async (e) => {
+        if (isPanning) {
+            const dx = e.clientX - panStart.x;
+            const dy = e.clientY - panStart.y;
+            viewport.offsetX += dx;
+            viewport.offsetY -= dy;
+            panStart = { x: e.clientX, y: e.clientY };
+            drawLoop();
+            return;
+        }
+
+        if (isRotating) {
+            if (isProcessingRotate) return;
+            isProcessingRotate = true;
+
+            const rect = canvas.getBoundingClientRect();
+            const w = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+            
+            try {
+                const res = await fetch('/api/action/rotate', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        anchor_idx: anchorIdx,
+                        mouse_x: w.x,
+                        mouse_y: w.y
+                    })
+                });
+                const result = await res.json();
+                targetYaw = result.target_yaw;
+                if (result.best_camera && result.best_camera.id !== currentCamIdx) {
+                    updateView(result.best_camera.id);
+                } else {
+                    drawLoop();
+                }
+            } finally {
+                isProcessingRotate = false;
+            }
+        }
+    });
+
+    canvas.addEventListener('dblclick', async (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const w = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+        
+        const res = await fetch('/api/action/move', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                target_x: w.x,
+                target_y: w.y,
+                current_idx: currentCamIdx
+            })
+        });
+        const bestCam = await res.json();
+        if (bestCam && bestCam.id !== undefined) {
+            updateView(bestCam.id);
+            anchorIdx = bestCam.id;
+        }
+    });
+
+    window.addEventListener('resize', () => {
+        setupCanvas();
+        drawLoop();
+    });
+
+    init();
+</script>
+</body>
+</html>
