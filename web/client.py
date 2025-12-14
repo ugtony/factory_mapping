@@ -75,7 +75,18 @@ def main():
             
             diag = res.get('diagnosis', {})
             if diag:
-                print(f"Details: Top1={diag.get('retrieval_top1')} (Score={diag.get('retrieval_score1')})")
+                # [Fix] 使用正確的 Key (與 Server 回傳的 Diagnosis Report 一致)
+                # 之前是 retrieval_top1 (小寫)，現在改為 Retrieval_Top1 (大寫開頭)
+                top1 = diag.get('Retrieval_Top1', 'N/A')
+                score = diag.get('Retrieval_Score1', 'N/A')
+                
+                # 如果是浮點數，做一點格式化
+                if isinstance(score, float):
+                    score_str = f"{score:.4f}"
+                else:
+                    score_str = str(score)
+
+                print(f"Details: Top1={top1} (Score={score_str})")
                 
         else:
             print(f"[Error] Server returned {resp.status_code}")

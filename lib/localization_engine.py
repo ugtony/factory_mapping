@@ -151,7 +151,7 @@ class LocalizationEngine:
                  return_details: bool = False, 
                  top_k_db: int = 10, 
                  verbose: bool = False,
-                 block_filter: list = None): # [Added] block_filter parameter
+                 block_filter: list = None):
         
         if fov_deg is None: fov_deg = self.default_fov
         
@@ -205,7 +205,6 @@ class LocalizationEngine:
 
         candidate_blocks = []
         for name, block in self.blocks.items():
-            # [Added] Block Filtering
             if block_filter is not None and name not in block_filter:
                 if verbose: print(f"  [Log] Skipping block {name} (not in filter)")
                 continue
@@ -222,7 +221,6 @@ class LocalizationEngine:
         candidate_blocks.sort(key=lambda x: x[0], reverse=True)
         candidate_blocks = candidate_blocks[:3]
 
-        # 記錄 Retrieval Top 3
         for i in range(3):
             rank = i + 1
             if i < len(candidate_blocks):
@@ -295,7 +293,6 @@ class LocalizationEngine:
                 target_ids = p3d_ids[m_db]
                 
                 has_3d = target_ids != -1
-                # [Fix] 強制轉為 Python int，避免 numpy.int64 造成 Pydantic 錯誤
                 n_3d = int(has_3d.sum())
                 current_block_stats['matches_3d_sum'] += n_3d
                 
@@ -404,8 +401,8 @@ class LocalizationEngine:
                 if success and qvec is not None:
                     res_diag = diag.copy()
                     res_diag.update({
-                        'pnp_top1_block': block_name,  # Renamed
-                        'pnp_top1_inliers': num_inliers, # Renamed
+                        'pnp_top1_block': block_name,
+                        'pnp_top1_inliers': num_inliers,
                         'num_matches_2d': current_block_stats['matches_2d_sum'],
                         'num_matches_3d': len(p2d_concat),
                         'status': 'Success',
@@ -424,12 +421,10 @@ class LocalizationEngine:
             except Exception as e:
                 print(f"[Error] PnP failed for {block_name}: {e}"); continue
         
-        # PnP Ranking Logic
         if valid_block_results:
             valid_block_results.sort(key=lambda x: x['inliers'], reverse=True)
             best_result = valid_block_results[0]
             
-            # PnP 2nd Place
             if len(valid_block_results) > 1:
                 second = valid_block_results[1]
                 best_result['diagnosis']['pnp_top2_inliers'] = second['inliers']
@@ -438,7 +433,6 @@ class LocalizationEngine:
                 best_result['diagnosis']['pnp_top2_inliers'] = 0
                 best_result['diagnosis']['pnp_top2_block'] = "None"
             
-            # PnP 3rd Place
             if len(valid_block_results) > 2:
                 third = valid_block_results[2]
                 best_result['diagnosis']['pnp_top3_inliers'] = third['inliers']
@@ -453,3 +447,58 @@ class LocalizationEngine:
                 best_result['diagnosis'][f'pnp_top{r}_block'] = "None"
             
         return best_result
+
+    # [Modified] 成為 Schema 定義的唯一來源
+    def format_diagnosis(self, diag_raw: dict = None) -> dict:
+        """
+        將原始的診斷字典轉換為扁平化的報表格式。
+        如果傳入 None 或空字典，將回傳預設的空值字典（用於產生 Header）。
+        """
+        if diag_raw is None: diag_raw = {}
+
+        # 1. 決定 Rank Owner
+        rank_owner = diag_raw.get('pnp_top1_block')
+        if not rank_owner or rank_owner == 'None':
+            rank_owner = diag_raw.get('retrieval_top1', 'None')
+        
+        def fmt_rank_name(name):
+            if not name or name == 'None': return 'None'
+            return f"{rank_owner}/{name}"
+
+        # 2. 處理 db_ranks
+        ranks = diag_raw.get('db_ranks', [])
+        if ranks is None: ranks = []
+        ranks = list(ranks)
+        while len(ranks) < 3: 
+            ranks.append({'name': 'None', 'matches_2d': 0})
+
+        # 3. 定義輸出字典 (這裡也是定義 CSV 欄位順序的地方)
+        # 即使 diag_raw 為空，這裡也會根據 .get() 的預設值產生完整的字典
+        return {
+            "Status": diag_raw.get('status', 'Unknown'),
+            
+            "PnP_Top1_Block": diag_raw.get('pnp_top1_block', 'None'),
+            "PnP_Top1_Inliers": diag_raw.get('pnp_top1_inliers', 0),
+            "PnP_Top2_Block": diag_raw.get('pnp_top2_block', 'None'),
+            "PnP_Top2_Inliers": diag_raw.get('pnp_top2_inliers', 0),
+            "PnP_Top3_Block": diag_raw.get('pnp_top3_block', 'None'),
+            "PnP_Top3_Inliers": diag_raw.get('pnp_top3_inliers', 0),
+
+            "Retrieval_Top1": diag_raw.get('retrieval_top1', 'None'),
+            "Retrieval_Score1": diag_raw.get('retrieval_score1', 0.0),
+            "Retrieval_Top2": diag_raw.get('retrieval_top2', 'None'),
+            "Retrieval_Score2": diag_raw.get('retrieval_score2', 0.0),
+            "Retrieval_Top3": diag_raw.get('retrieval_top3', 'None'),
+            "Retrieval_Score3": diag_raw.get('retrieval_score3', 0.0),
+
+            "R1_Name": fmt_rank_name(ranks[0]['name']),
+            "R1_Match": ranks[0]['matches_2d'],
+            "R2_Name": fmt_rank_name(ranks[1]['name']),
+            "R2_Match": ranks[1]['matches_2d'],
+            "R3_Name": fmt_rank_name(ranks[2]['name']),
+            "R3_Match": ranks[2]['matches_2d'],
+
+            "Num_Keypoints": diag_raw.get('num_kpts', 0),
+            "Num_Matches_2D": diag_raw.get('num_matches_2d', 0),
+            "Num_Matches_3D": diag_raw.get('num_matches_3d', 0)
+        }
