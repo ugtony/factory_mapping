@@ -63,10 +63,12 @@ def main():
     if args.block_filter:
         filter_list = [b.strip() for b in args.block_filter.split(',') if b.strip()]
 
+    # [Modified] anchors_path 改為從 args.reference_dir 讀取
+    # 這樣 anchors.json 就可以跟著模型資料夾一起移動
     engine = LocalizationEngine(
         project_root=project_root,
         config_path=project_root / "project_config.env",
-        anchors_path=project_root / "anchors.json",
+        anchors_path=args.reference_dir / "anchors.json", 
         outputs_dir=args.reference_dir 
     )
     

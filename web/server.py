@@ -54,11 +54,12 @@ engine: LocalizationEngine = None
 def startup_event():
     global engine
     print("=== Starting Localization Engine ===")
-    # 初始化引擎，載入模型與錨點設定
+    
     engine = LocalizationEngine(
         project_root=project_root, 
         config_path=project_root / "project_config.env",
-        anchors_path=project_root / "anchors.json"
+        anchors_path=args.reference_dir / "anchors.json", 
+        outputs_dir=args.reference_dir 
     )
     print("✅ Server Ready!")
 
@@ -140,30 +141,46 @@ async def localize_endpoint(
         }
     
     # 6. 處理成功情況 (座標轉換)
-    q, t = result['pose']['qvec'], result['pose']['tvec']
-    trans = result['transform']
+    # [Modified] 這裡的 Map 座標計算其實已經整合進 Engine 了，
+    # 但為了維持 API 回傳欄位一致性，我們直接從 result 取得 Map 座標
     
-    # SfM 座標轉 World 座標
-    q_scipy = colmap_to_scipy_quat(q)
-    R_w2c = Rotation.from_quat(q_scipy).as_matrix()
-    R_c2w = R_w2c.T
-    cam_center_sfm = -R_c2w @ t
-    view_dir = R_c2w[:, 2]
-    sfm_yaw = np.degrees(np.arctan2(view_dir[1], view_dir[0]))
+    # 注意：如果 localization_engine.py 已經更新計算 Map 座標，
+    # result['diagnosis'] 裡面會有 map_x, map_y 等，但 result 本身可能也有這些 key
+    # 這裡我們保留原本的邏輯做為備援，或者直接讀取 engine 回傳的 diagnosis 內容
     
-    # 轉換到 Map 座標 (若有 anchors 設定)
-    if trans:
-        p_map = trans['s'] * (trans['R'] @ cam_center_sfm[:2]) + trans['t']
-        map_yaw = sfm_yaw + np.degrees(trans['theta'])
-        map_yaw = (map_yaw + 180) % 360 - 180
+    # 優先使用 engine 算好的 (如果有的話)
+    if 'map_x' in formatted_diag and formatted_diag['map_x'] != "":
+         p_map = [formatted_diag['map_x'], formatted_diag['map_y']]
+         map_yaw = formatted_diag['map_yaw']
+         block_name = result['block'] # 或 formatted_diag['PnP_Top1_Block']
+         inliers = result['inliers']
     else:
-        p_map = cam_center_sfm[:2]
-        map_yaw = sfm_yaw
+        # Fallback: 如果 Engine 沒算，這裡再算一次 (舊邏輯)
+        q, t = result['pose']['qvec'], result['pose']['tvec']
+        trans = result['transform']
+        
+        q_scipy = colmap_to_scipy_quat(q)
+        R_w2c = Rotation.from_quat(q_scipy).as_matrix()
+        R_c2w = R_w2c.T
+        cam_center_sfm = -R_c2w @ t
+        view_dir = R_c2w[:, 2]
+        sfm_yaw = np.degrees(np.arctan2(view_dir[1], view_dir[0]))
+        
+        if trans:
+            p_map = trans['s'] * (trans['R'] @ cam_center_sfm[:2]) + trans['t']
+            map_yaw = sfm_yaw + np.degrees(trans['theta'])
+            map_yaw = (map_yaw + 180) % 360 - 180
+        else:
+            p_map = cam_center_sfm[:2]
+            map_yaw = sfm_yaw
+        
+        block_name = result['block']
+        inliers = result['inliers']
 
     return {
         "status": "success", 
-        "block": result['block'], 
-        "inliers": result['inliers'],
+        "block": block_name, 
+        "inliers": inliers,
         "map_x": float(p_map[0]), 
         "map_y": float(p_map[1]), 
         "map_yaw": float(map_yaw),
@@ -176,6 +193,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--reference_dir", type=Path, help="Path to reference hloc models", default="outputs-hloc")
     args = parser.parse_args()
     
     print(f"Starting Localization Server on http://{args.host}:{args.port}")

@@ -13,10 +13,11 @@ from unittest.mock import patch
 from hloc import extractors, matchers, extract_features, match_features
 from hloc.utils.base_model import dynamic_load
 
+# [Modified] 引入 colmap_to_scipy_quat 以便進行座標轉換
 try:
-    from .map_utils import compute_sim2_transform
+    from .map_utils import compute_sim2_transform, colmap_to_scipy_quat
 except ImportError:
-    from map_utils import compute_sim2_transform
+    from map_utils import compute_sim2_transform, colmap_to_scipy_quat
 
 class LocalizationEngine:
     def __init__(self, project_root: Path, config_path: Path, anchors_path: Path, outputs_dir: Path = None, device: str = None):
@@ -88,10 +89,13 @@ class LocalizationEngine:
         self._load_blocks(target_outputs, anchors_path)
 
     def _load_blocks(self, outputs_root, anchors_path):
-        anchors = {}
-        if anchors_path.exists():
-            with open(anchors_path, 'r') as f: anchors = json.load(f)
-            print(f"[Init] Loaded anchors for: {list(anchors.keys())}")
+        # [Modified] 強制檢查 Anchors 檔案是否存在，若無則拋出例外
+        if not anchors_path.exists():
+            raise FileNotFoundError(f"[Error] Anchors file missing at: {anchors_path}")
+
+        with open(anchors_path, 'r') as f:
+            anchors = json.load(f)
+        print(f"[Init] Loaded anchors for: {list(anchors.keys())}")
 
         for block_dir in outputs_root.iterdir():
             if not block_dir.is_dir(): continue
@@ -190,7 +194,11 @@ class LocalizationEngine:
             'pnp_top1_block': 'None', 'pnp_top1_inliers': 0, 
             'num_matches_2d': 0, 'num_matches_3d': 0, 
             'status': 'Fail_Unknown',
-            'db_ranks': [] 
+            'db_ranks': [],
+            # [New] 預設為 None 或空字串
+            'pose_qw': "", 'pose_qx': "", 'pose_qy': "", 'pose_qz': "",
+            'pose_tx': "", 'pose_ty': "", 'pose_tz': "",
+            'map_x': "", 'map_y': "", 'map_yaw': ""
         }
 
         kpts[:, 0] = (kpts[:, 0] + 0.5) * scale_x
@@ -399,6 +407,37 @@ class LocalizationEngine:
                     print(f"    [PnP Result] Failed.")
 
                 if success and qvec is not None:
+                    # [New] 計算地圖座標
+                    map_x, map_y, map_yaw = None, None, None
+                    
+                    # 1. 計算 SfM 座標系下的位置與朝向
+                    q_scipy = colmap_to_scipy_quat(qvec)
+                    R_w2c = Rotation.from_quat(q_scipy).as_matrix()
+                    R_c2w = R_w2c.T
+                    t_vec = np.array(tvec)
+                    cam_center_sfm = -R_c2w @ t_vec
+                    view_dir = R_c2w[:, 2]
+                    sfm_yaw = np.degrees(np.arctan2(view_dir[1], view_dir[0]))
+                    
+                    # 2. 轉換到地圖座標
+                    trans = block.get('transform')
+                    if trans:
+                        s = trans['s']
+                        theta = trans['theta']
+                        t_map = trans['t']
+                        R_map = trans['R']
+                        
+                        p_sfm_2d = cam_center_sfm[:2]
+                        p_map = s * (R_map @ p_sfm_2d) + t_map
+                        map_x, map_y = float(p_map[0]), float(p_map[1])
+                        
+                        m_yaw = sfm_yaw + np.degrees(theta)
+                        map_yaw = float((m_yaw + 180) % 360 - 180)
+                    else:
+                        # 如果沒有 Anchors，則回傳 SfM 原始座標
+                        map_x, map_y = float(cam_center_sfm[0]), float(cam_center_sfm[1])
+                        map_yaw = float(sfm_yaw)
+
                     res_diag = diag.copy()
                     res_diag.update({
                         'pnp_top1_block': block_name,
@@ -406,7 +445,12 @@ class LocalizationEngine:
                         'num_matches_2d': current_block_stats['matches_2d_sum'],
                         'num_matches_3d': len(p2d_concat),
                         'status': 'Success',
-                        'db_ranks': current_db_ranks 
+                        'db_ranks': current_db_ranks,
+                        
+                        # [New] 寫入 6DoF 與 Map Coordinates
+                        'pose_qw': qvec[0], 'pose_qx': qvec[1], 'pose_qy': qvec[2], 'pose_qz': qvec[3],
+                        'pose_tx': tvec[0], 'pose_ty': tvec[1], 'pose_tz': tvec[2],
+                        'map_x': map_x, 'map_y': map_y, 'map_yaw': map_yaw
                     })
                     
                     res = {
@@ -500,5 +544,17 @@ class LocalizationEngine:
 
             "Num_Keypoints": diag_raw.get('num_kpts', 0),
             "Num_Matches_2D": diag_raw.get('num_matches_2d', 0),
-            "Num_Matches_3D": diag_raw.get('num_matches_3d', 0)
+            "Num_Matches_3D": diag_raw.get('num_matches_3d', 0),
+            
+            # [New] 新增 Pose 與 Map 座標欄位
+            "Pose_Qw": diag_raw.get('pose_qw', ""),
+            "Pose_Qx": diag_raw.get('pose_qx', ""),
+            "Pose_Qy": diag_raw.get('pose_qy', ""),
+            "Pose_Qz": diag_raw.get('pose_qz', ""),
+            "Pose_Tx": diag_raw.get('pose_tx', ""),
+            "Pose_Ty": diag_raw.get('pose_ty', ""),
+            "Pose_Tz": diag_raw.get('pose_tz', ""),
+            "Map_X": diag_raw.get('map_x', ""),
+            "Map_Y": diag_raw.get('map_y', ""),
+            "Map_Yaw": diag_raw.get('map_yaw', "")
         }
