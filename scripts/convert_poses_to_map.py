@@ -1,169 +1,198 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+convert_poses_to_map.py (Visualization Only Version)
+
+用途：
+    讀取由 run_localization.py 或 server.py 產生的診斷報告 (CSV)，
+    直接使用其中的 Map_X, Map_Y, Map_Yaw 欄位繪製定位結果圖。
+    不再重複執行 6DoF 轉 2D 的計算。
+
+用法:
+    python scripts/convert_poses_to_map.py diagnosis_report.csv [--anchors anchors.json] [--output result.png]
+"""
+
 import argparse
 import json
-import numpy as np
-import sys
-from pathlib import Path
-from scipy.spatial.transform import Rotation
-import pycolmap
+import csv
 import matplotlib.pyplot as plt
-
-# [Plan A] Setup path to find 'lib'
-current_dir = Path(__file__).resolve().parent
-project_root = current_dir.parent
-sys.path.append(str(project_root))
-
-# [新增] 引入標準轉換函式
-from lib.map_utils import compute_sim2_transform, colmap_to_scipy_quat
-
-def parse_pose(qvec, tvec):
-    """
-    解析姿態。
-    qvec: COLMAP 格式 [w, x, y, z]
-    tvec: [tx, ty, tz]
-    """
-    # 使用標準函式轉換，不要依賴參數順序解包
-    q_scipy = colmap_to_scipy_quat(qvec)
-    
-    rot_w2c = Rotation.from_quat(q_scipy)
-    R_w2c = rot_w2c.as_matrix()
-    t_vec = np.array(tvec)
-    R_c2w = R_w2c.T
-    center = -R_c2w @ t_vec
-    view_dir = R_c2w[:, 2]
-    yaw = np.degrees(np.arctan2(view_dir[1], view_dir[0]))
-    return center, yaw
+import numpy as np
+from pathlib import Path
 
 def get_data_bounds(data_points, anchors_cfg):
-    xs, ys = [], []
-    for d in data_points: xs.append(d['x']); ys.append(d['y'])
+    """計算繪圖範圍，包含定位點與 Anchors"""
+    xs = [d['x'] for d in data_points]
+    ys = [d['y'] for d in data_points]
+    
+    # 將 Anchors 的起點終點也納入範圍，確保背景圖完整
     for cfg in anchors_cfg.values():
-        xs.append(cfg['start_map_xy'][0]); ys.append(cfg['start_map_xy'][1])
-        xs.append(cfg['end_map_xy'][0]); ys.append(cfg['end_map_xy'][1])
-    if not xs: return (0,1,0,1), 1.0
-    min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
+        if 'start_map_xy' in cfg:
+            xs.append(cfg['start_map_xy'][0])
+            ys.append(cfg['start_map_xy'][1])
+        if 'end_map_xy' in cfg:
+            xs.append(cfg['end_map_xy'][0])
+            ys.append(cfg['end_map_xy'][1])
+            
+    if not xs: return (0, 1, 0, 1), 1.0
+    
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
     span_x, span_y = max_x - min_x, max_y - min_y
     return (min_x, max_x, min_y, max_y), max(span_x, span_y)
 
 def plot_results(output_png, data_points, anchors_cfg):
+    """繪製結果圖"""
     (min_x, max_x, min_y, max_y), map_span = get_data_bounds(data_points, anchors_cfg)
-    w_range, h_range = max_x - min_x, max_y - min_y
-    pad_x, pad_y = max(w_range * 0.1, 1.0), max(h_range * 0.1, 1.0)
-    plot_xlim, plot_ylim = (min_x - pad_x, max_x + pad_x), (min_y - pad_y, max_y + pad_y)
     
-    final_w, final_h = plot_xlim[1] - plot_xlim[0], plot_ylim[1] - plot_ylim[0]
-    max_fig_size, aspect = 14, final_w / final_h
-    fig_w = max_fig_size if aspect > 1 else max_fig_size * aspect
-    fig_h = max_fig_size / aspect if aspect > 1 else max_fig_size
-    fig_w, fig_h = max(fig_w, 5), max(fig_h, 5)
+    # 增加一點邊界留白
+    pad_x = max((max_x - min_x) * 0.1, 1.0)
+    pad_y = max((max_y - min_y) * 0.1, 1.0)
+    plot_xlim = (min_x - pad_x, max_x + pad_x)
+    plot_ylim = (min_y - pad_y, max_y + pad_y)
 
-    plt.figure(figsize=(fig_w, fig_h)) 
-    plt.title("Localization Results (Auto-Fit)"); plt.xlabel("Map X"); plt.ylabel("Map Y")
+    # 動態計算圖片尺寸
+    final_w = plot_xlim[1] - plot_xlim[0]
+    final_h = plot_ylim[1] - plot_ylim[0]
+    aspect = final_w / final_h if final_h > 0 else 1.0
+    
+    fig_h = 10
+    fig_w = fig_h * aspect
+    if fig_w > 20: fig_w = 20 # 限制最大寬度以免太寬
+    
+    plt.figure(figsize=(fig_w, fig_h))
+    plt.title(f"Localization Map Result (N={len(data_points)})")
+    plt.xlabel("Map X")
+    plt.ylabel("Map Y")
     plt.grid(True, linestyle='--', alpha=0.6)
-    
-    arrow_len = max(map_span * 0.02, 0.5)
-    text_offset = arrow_len * 0.6
+
+    # 1. 繪製定位點
+    # 根據 Block 分類顏色
     unique_blocks = sorted(list(set(d['block'] for d in data_points)))
-    colors = plt.cm.tab10(np.linspace(0, 1, len(unique_blocks)))
-    block_color_map = {b: c for b, c in zip(unique_blocks, colors)}
+    cmap = plt.get_cmap("tab10")
+    block_colors = {b: cmap(i % 10) for i, b in enumerate(unique_blocks)}
 
+    arrow_len = map_span * 0.02 if map_span > 0 else 1.0
+    
     for d in data_points:
-        x, y, yaw = d['x'], d['y'], d['yaw']
-        color = block_color_map.get(d['block'], 'black')
-        plt.scatter(x, y, c=[color], s=30, label=d['block'], edgecolors='k', linewidth=0.5, alpha=0.7)
-        dx, dy = arrow_len * np.cos(np.deg2rad(yaw)), arrow_len * np.sin(np.deg2rad(yaw))
-        plt.arrow(x, y, dx, dy, head_width=arrow_len*0.4, head_length=arrow_len*0.5, fc=color, ec=color, alpha=0.8)
-        plt.text(x + text_offset, y + text_offset, f"{Path(d['name']).name}", fontsize=6, color=color, alpha=0.8, rotation=45)
+        color = block_colors.get(d['block'], 'black')
+        plt.scatter(d['x'], d['y'], color=color, s=30, alpha=0.8, edgecolors='k', linewidth=0.3)
+        
+        # 繪製方向箭頭 (Yaw)
+        if d['yaw'] is not None:
+            # Map_Yaw 通常是 Degree，需轉 Radian
+            dx = arrow_len * np.cos(np.radians(d['yaw']))
+            dy = arrow_len * np.sin(np.radians(d['yaw']))
+            plt.arrow(d['x'], d['y'], dx, dy, head_width=arrow_len*0.3, color=color, alpha=0.8)
+        
+        # (選用) 標註檔名，若點太多建議註解掉
+        # plt.text(d['x'], d['y'], d['name'], fontsize=6, alpha=0.5)
 
-    added_anchor_label = False
+    # 2. 繪製 Anchors (參考線)
+    added_label = False
     for block_name, cfg in anchors_cfg.items():
-        sx, sy = cfg['start_map_xy']; ex, ey = cfg['end_map_xy']
-        plt.scatter(sx, sy, c='red', marker='x', s=150, linewidth=2.5, label='Anchors' if not added_anchor_label else "", zorder=10)
-        plt.text(sx, sy - text_offset, f" {block_name}_Start", color='red', fontsize=8, fontweight='bold', zorder=11, verticalalignment='top')
-        plt.scatter(ex, ey, c='red', marker='x', s=150, linewidth=2.5, zorder=10)
-        plt.text(ex, ey - text_offset, f" {block_name}_End", color='red', fontsize=8, fontweight='bold', zorder=11, verticalalignment='top')
-        plt.plot([sx, ex], [sy, ey], 'r--', alpha=0.3, linewidth=1)
-        added_anchor_label = True
+        if 'start_map_xy' not in cfg or 'end_map_xy' not in cfg: continue
+        
+        sx, sy = cfg['start_map_xy']
+        ex, ey = cfg['end_map_xy']
+        
+        label = "Anchors" if not added_label else None
+        plt.plot([sx, ex], [sy, ey], 'r--', linewidth=1.5, alpha=0.4, label=label, zorder=0)
+        plt.scatter([sx, ex], [sy, ey], marker='x', color='red', s=60, zorder=0)
+        
+        # 標註 Anchor 名稱
+        plt.text(sx, sy, f" {block_name}_Start", color='red', fontsize=8, alpha=0.6)
+        added_label = True
 
-    plt.xlim(plot_xlim); plt.ylim(plot_ylim); plt.axis('equal')
-    handles, labels = plt.gca().get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    plt.legend(by_label.values(), by_label.keys(), loc='upper left', bbox_to_anchor=(1, 1))
-    plt.tight_layout(); plt.savefig(output_png, dpi=150, bbox_inches='tight')
-    print(f"🖼️  Plot saved to: {output_png}")
+    # 建立 Legend
+    from matplotlib.lines import Line2D
+    legend_elements = [Line2D([0], [0], marker='o', color='w', label=b, 
+                          markerfacecolor=c, markersize=8) for b, c in block_colors.items()]
+    if added_label:
+        legend_elements.append(Line2D([0], [0], color='r', linestyle='--', label='Anchors'))
+        
+    plt.legend(handles=legend_elements, loc='best')
+    plt.xlim(plot_xlim)
+    plt.ylim(plot_ylim)
+    plt.tight_layout()
+    plt.savefig(output_png, dpi=150)
+    plt.close()
+    print(f"🖼️  [Output] Plot saved to: {output_png}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert localization poses to map coordinates.")
-    
-    # [Modified] submission 改為 positional argument
-    parser.add_argument("submission", type=Path, help="Path to input poses file (e.g. offline_results.txt)")
-    
-    # [Modified] anchors 預設為 ./anchors.json
-    parser.add_argument("--anchors", type=Path, default="anchors.json", help="Path to anchors.json (default: anchors.json)")
-    
-    parser.add_argument("--output", type=Path, default="submission_map.txt", help="Output mapped poses file")
-    
-    # [Modified] plot 改為預設開啟 (True)，並提供 --no-plot 關閉
-    parser.add_argument("--no-plot", action="store_false", dest="plot", help="Disable visualization plotting")
-    parser.set_defaults(plot=True)
+    parser = argparse.ArgumentParser(description="Visualize localization results from diagnosis report (CSV).")
+    parser.add_argument("report_csv", type=Path, help="Path to diagnosis_report.csv (generated by run_localization.py)")
+    parser.add_argument("--anchors", type=Path, default="anchors.json", help="Path to anchors.json (for visualization context)")
+    parser.add_argument("--output", type=Path, default=None, help="Output PNG path (default: same as csv name)")
     
     args = parser.parse_args()
 
-    if not args.anchors.exists():
-        print(f"[Error] Anchors file not found: {args.anchors}")
-        print("Please provide correct path via --anchors or ensure anchors.json exists in current directory.")
+    if not args.report_csv.exists():
+        print(f"[Error] Report file not found: {args.report_csv}")
         return
 
-    with open(args.anchors, 'r') as f: anchors_cfg = json.load(f)
-    transforms = {}
-    print(f"[Step 1] Computing transforms...")
-    for block_name, cfg in anchors_cfg.items():
+    # 1. 讀取 Anchors (僅用於繪圖參考，不需要它來計算轉換)
+    anchors_cfg = {}
+    if args.anchors.exists():
         try:
-            recon = pycolmap.Reconstruction(Path(cfg['sfm_path']))
-            trans = compute_sim2_transform(recon, cfg)
-            if trans:
-                transforms[block_name] = trans
-                print(f"  > {block_name}: Scale={trans['s']:.4f}, Rot={np.degrees(trans['theta']):.2f}°")
-        except Exception as e: print(f"  [Error] {block_name} failed: {e}")
+            with open(args.anchors, 'r') as f:
+                anchors_cfg = json.load(f)
+        except Exception as e:
+            print(f"[Warn] Failed to load anchors: {e}")
+    else:
+        print(f"[Warn] Anchors file not found: {args.anchors}. Plotting without reference anchors.")
 
-    if not transforms: print("[Error] No valid transforms."); return
-    print(f"\n[Step 2] Converting poses...")
-    plot_data = []
+    # 2. 讀取 CSV
+    data_points = []
+    print(f"[Info] Reading report: {args.report_csv}")
     
-    with open(args.submission, 'r') as f_in, open(args.output, 'w') as f_out:
-        f_out.write("ImageName, MapX, MapY, MapYaw, BlockName\n")
-        count = 0
-        for line in f_in:
-            line = line.strip()
-            if not line or line.startswith('#'): continue
-            parts = line.split()
-            if len(parts) < 8: continue
-            try:
-                name = parts[0]
-                # 明確讀取為列表，不要用 *vals 解包
-                qvec = list(map(float, parts[1:5])) # w, x, y, z
-                tvec = list(map(float, parts[5:8])) # tx, ty, tz
-                block_name = parts[8] if len(parts) >= 9 else list(transforms.keys())[0]
-            except ValueError: continue
-            if block_name not in transforms: continue
-            
-            # 傳入 qvec 與 tvec 列表
-            sfm_center, sfm_yaw = parse_pose(qvec, tvec)
-            
-            t_data = transforms[block_name]
-            s, theta, t_vec_map = t_data['s'], t_data['theta'], t_data['t']
-            
-            c, si = np.cos(theta), np.sin(theta)
-            R_mat = np.array([[c, -si], [si, c]])
-            p_map = s * (R_mat @ sfm_center[:2]) + t_vec_map
-            map_yaw = (sfm_yaw + np.degrees(theta) + 180) % 360 - 180
-            
-            f_out.write(f"{name}, {p_map[0]:.4f}, {p_map[1]:.4f}, {map_yaw:.4f}, {block_name}\n")
-            plot_data.append({'name': name, 'x': p_map[0], 'y': p_map[1], 'yaw': map_yaw, 'block': block_name})
-            count += 1
+    with open(args.report_csv, 'r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        
+        # 檢查必要欄位是否存在
+        if 'Map_X' not in reader.fieldnames:
+            print("[Error] CSV format error: Column 'Map_X' not found.")
+            print("Please ensure your localization_engine.py is updated and calculating map coordinates.")
+            return
 
-    print(f"✅ Done! Converted {count} poses to '{args.output}'")
-    if args.plot and plot_data: plot_results(args.output.with_suffix('.png'), plot_data, anchors_cfg)
+        for row in reader:
+            # 跳過未定位成功的點 (Map_X 為空)
+            if not row.get('Map_X') or row['Map_X'].strip() == "":
+                continue
+                
+            try:
+                x = float(row['Map_X'])
+                y = float(row['Map_Y'])
+                # 若 Map_Yaw 為空則預設 0
+                yaw = float(row['Map_Yaw']) if row.get('Map_Yaw') else 0.0
+                
+                # 取得 Block 名稱 (優先使用 PnP_Top1_Block)
+                block = row.get('PnP_Top1_Block', 'Unknown')
+                if block == 'None': block = 'Unknown'
+                
+                name = row.get('ImageName', 'Unknown')
+                
+                data_points.append({
+                    'name': name,
+                    'x': x,
+                    'y': y,
+                    'yaw': yaw,
+                    'block': block
+                })
+            except ValueError:
+                continue
+
+    print(f"[Info] Loaded {len(data_points)} localized points.")
+
+    if not data_points:
+        print("[Warn] No valid points found in report (Maybe all failed?).")
+        return
+
+    # 3. 繪圖
+    out_path = args.output
+    if out_path is None:
+        out_path = args.report_csv.with_suffix('.png')
+    
+    plot_results(out_path, data_points, anchors_cfg)
 
 if __name__ == "__main__":
     main()
