@@ -19,7 +19,6 @@ except ImportError:
     import visualize_sfm_open3d
 
 def draw_matches(query_img, db_img_path, kpts_q, kpts_db, matches, out_path):
-    # (省略 draw_matches 內容，保持不變)
     try:
         if not Path(db_img_path).exists():
             print(f"  [Viz] DB image not found: {db_img_path}"); return
@@ -54,19 +53,29 @@ def main():
     parser.add_argument("--fov", type=float, default=None, help="Camera field of view (deg)")
     parser.add_argument("--output", type=Path, default="offline_results.txt", help="Output poses file")
     parser.add_argument("--report", type=Path, default="diagnosis_report.csv", help="Output diagnosis CSV report")
+    parser.add_argument("--block-filter", type=str, default=None, help="Comma-separated list of blocks (e.g. brazil360,miami360)")
     parser.add_argument("--viz", action="store_true", help="Visualize both 2D matches and 3D point cloud")
     parser.add_argument("--verbose", action="store_true", help="Enable detailed logging")
     args = parser.parse_args()
 
+    # 解析 Block Filter
+    filter_list = None
+    if args.block_filter:
+        filter_list = [b.strip() for b in args.block_filter.split(',') if b.strip()]
+
+    # [Modified] anchors_path 改為從 args.reference_dir 讀取
+    # 這樣 anchors.json 就可以跟著模型資料夾一起移動
     engine = LocalizationEngine(
         project_root=project_root,
         config_path=project_root / "project_config.env",
-        anchors_path=project_root / "anchors.json",
+        anchors_path=args.reference_dir / "anchors.json", 
         outputs_dir=args.reference_dir 
     )
     
     fov = args.fov if args.fov else engine.default_fov
-    print(f"=== Starting Offline Localization (FOV={fov}) ===")
+    
+    filter_msg = f" (Filter: {filter_list})" if filter_list else " (All Blocks)"
+    print(f"=== Starting Offline Localization (FOV={fov}){filter_msg} ===")
     
     if not args.query_dir.exists():
         print(f"[Error] Query directory not found: {args.query_dir}")
@@ -82,24 +91,15 @@ def main():
     success_blocks = [] 
     success_count = 0
     
-    # [New] Enhanced CSV Header (Renamed PnP Columns)
     print(f"[Info] Diagnosis report will be saved to: {args.report}")
     csv_file = open(args.report, 'w', newline='')
     csv_writer = csv.writer(csv_file)
-    csv_header = [
-        "ImageName", "Status", 
-        "PnP_Top1_Block", "PnP_Top1_Inliers", # Selected -> PnP_Top1
-        "PnP_Top2_Block", "PnP_Top2_Inliers", 
-        "PnP_Top3_Block", "PnP_Top3_Inliers", 
-        "Retrieval_Top1", "Retrieval_Score1", 
-        "Retrieval_Top2", "Retrieval_Score2", 
-        "Retrieval_Top3", "Retrieval_Score3", 
-        "R1_Name", "R1_Match",
-        "R2_Name", "R2_Match",
-        "R3_Name", "R3_Match",
-        "Num_Keypoints", "Num_Matches_2D", "Num_Matches_3D"
-    ]
-    csv_writer.writerow(csv_header)
+    
+    # [Config] CSV Header - 動態從 Engine 獲取 (Dummy Run)
+    # 這確保了只要 Engine 的 format_diagnosis 變了，這裡的 Header 也會自動變
+    dummy_diag = engine.format_diagnosis({}) 
+    csv_keys = ["ImageName"] + list(dummy_diag.keys())
+    csv_writer.writerow(csv_keys)
 
     for q_path in query_files:
         print(f"Processing {q_path.name}...", end=" ", flush=True)
@@ -109,47 +109,23 @@ def main():
         if img is None: print("[Error] Read failed"); continue
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        ret = engine.localize(img, fov_deg=fov, return_details=args.viz, verbose=args.verbose)
+        # 執行定位
+        ret = engine.localize(
+            img, 
+            fov_deg=fov, 
+            return_details=args.viz, 
+            verbose=args.verbose, 
+            block_filter=filter_list 
+        )
         
-        diag = ret.get('diagnosis', {})
-        ranks = diag.get('db_ranks', [])
-        while len(ranks) < 3: ranks.append({'name': 'None', 'matches_2d': 0})
-        
-        # rank_owner 邏輯更新 (使用 pnp_top1_block)
-        rank_owner = diag.get('pnp_top1_block')
-        if rank_owner == 'None' or not rank_owner:
-            rank_owner = diag.get('retrieval_top1', 'None')
-            
-        def fmt_rank_name(name):
-            if name == 'None': return 'None'
-            return f"{rank_owner}/{name}"
+        # [Modified] 呼叫 Engine 的格式化方法
+        raw_diag = ret.get('diagnosis', {})
+        fmt_diag = engine.format_diagnosis(raw_diag)
 
-        # [New] Write Enhanced Row (Using pnp_topX keys)
-        row = [
-            q_path.name,
-            diag.get('status', 'Unknown'),
-            diag.get('pnp_top1_block', 'None'),
-            diag.get('pnp_top1_inliers', 0),
-            diag.get('pnp_top2_block', 'None'),
-            diag.get('pnp_top2_inliers', 0),
-            diag.get('pnp_top3_block', 'None'),
-            diag.get('pnp_top3_inliers', 0),
-            
-            diag.get('retrieval_top1', 'None'),
-            f"{diag.get('retrieval_score1', 0.0):.4f}",
-            diag.get('retrieval_top2', 'None'),
-            f"{diag.get('retrieval_score2', 0.0):.4f}",
-            diag.get('retrieval_top3', 'None'),
-            f"{diag.get('retrieval_score3', 0.0):.4f}",
-            
-            fmt_rank_name(ranks[0]['name']), ranks[0]['matches_2d'],
-            fmt_rank_name(ranks[1]['name']), ranks[1]['matches_2d'],
-            fmt_rank_name(ranks[2]['name']), ranks[2]['matches_2d'],
-            
-            diag.get('num_kpts', 0),
-            diag.get('num_matches_2d', 0),
-            diag.get('num_matches_3d', 0)
-        ]
+        # [Modified] 組合 CSV Row
+        # 第一欄是檔名，後續欄位依照 csv_keys 的順序從 fmt_diag 取值
+        row = [q_path.name] + [fmt_diag.get(k, "") for k in csv_keys[1:]]
+        
         csv_writer.writerow(row)
         csv_file.flush()
 
@@ -166,11 +142,12 @@ def main():
             if args.viz and 'matches' in ret:
                 draw_matches(img, ret['db_image_path'], ret['kpts_query'], ret['kpts_db'], ret['matches'], viz_dir_2d / f"{q_path.stem}_matches.jpg")
         else:
-            status = diag.get('status', 'Failed')
-            top1 = diag.get('retrieval_top1', 'None')
-            score = diag.get('retrieval_score1', 0.0)
-            r1_name = fmt_rank_name(ranks[0]['name'])
-            r1_m = ranks[0]['matches_2d']
+            # 失敗時使用 fmt_diag 來取得資訊 (欄位已經是 Title Case)
+            status = fmt_diag.get('Status', 'Failed')
+            top1 = fmt_diag.get('Retrieval_Top1', 'None')
+            score = fmt_diag.get('Retrieval_Score1', 0.0)
+            r1_name = fmt_diag.get('R1_Name', 'None')
+            r1_m = fmt_diag.get('R1_Match', 0)
             print(f"❌ {status} (Top1: {top1}, Score: {score:.2f}) -> BestDB: {r1_name} ({r1_m} matches)")
 
     csv_file.close()

@@ -13,10 +13,11 @@ from unittest.mock import patch
 from hloc import extractors, matchers, extract_features, match_features
 from hloc.utils.base_model import dynamic_load
 
+# [Modified] 引入 colmap_to_scipy_quat 以便進行座標轉換
 try:
-    from .map_utils import compute_sim2_transform
+    from .map_utils import compute_sim2_transform, colmap_to_scipy_quat
 except ImportError:
-    from map_utils import compute_sim2_transform
+    from map_utils import compute_sim2_transform, colmap_to_scipy_quat
 
 class LocalizationEngine:
     def __init__(self, project_root: Path, config_path: Path, anchors_path: Path, outputs_dir: Path = None, device: str = None):
@@ -88,10 +89,13 @@ class LocalizationEngine:
         self._load_blocks(target_outputs, anchors_path)
 
     def _load_blocks(self, outputs_root, anchors_path):
-        anchors = {}
-        if anchors_path.exists():
-            with open(anchors_path, 'r') as f: anchors = json.load(f)
-            print(f"[Init] Loaded anchors for: {list(anchors.keys())}")
+        # [Modified] 強制檢查 Anchors 檔案是否存在，若無則拋出例外
+        if not anchors_path.exists():
+            raise FileNotFoundError(f"[Error] Anchors file missing at: {anchors_path}")
+
+        with open(anchors_path, 'r') as f:
+            anchors = json.load(f)
+        print(f"[Init] Loaded anchors for: {list(anchors.keys())}")
 
         for block_dir in outputs_root.iterdir():
             if not block_dir.is_dir(): continue
@@ -145,7 +149,14 @@ class LocalizationEngine:
             }
 
     @torch.no_grad()
-    def localize(self, image_arr: np.ndarray, fov_deg: float = None, return_details: bool = False, top_k_db: int = 10, verbose: bool = False):
+    def localize(self, 
+                 image_arr: np.ndarray, 
+                 fov_deg: float = None, 
+                 return_details: bool = False, 
+                 top_k_db: int = 10, 
+                 verbose: bool = False,
+                 block_filter: list = None):
+        
         if fov_deg is None: fov_deg = self.default_fov
         
         h_orig, w_orig = image_arr.shape[:2]
@@ -177,13 +188,17 @@ class LocalizationEngine:
         if verbose:
             print(f"  [Log] Query Kpts: {len(kpts)} (Scale: {scale_x:.4f}, {scale_y:.4f})")
         
-        # [Init Diagnosis] (Updated keys)
+        # [Init Diagnosis]
         diag = {
             'num_kpts': len(kpts),
-            'pnp_top1_block': 'None', 'pnp_top1_inliers': 0, # Renamed
+            'pnp_top1_block': 'None', 'pnp_top1_inliers': 0, 
             'num_matches_2d': 0, 'num_matches_3d': 0, 
             'status': 'Fail_Unknown',
-            'db_ranks': [] 
+            'db_ranks': [],
+            # [New] 預設為 None 或空字串
+            'pose_qw': "", 'pose_qx': "", 'pose_qy': "", 'pose_qz': "",
+            'pose_tx': "", 'pose_ty': "", 'pose_tz': "",
+            'map_x': "", 'map_y': "", 'map_yaw': ""
         }
 
         kpts[:, 0] = (kpts[:, 0] + 0.5) * scale_x
@@ -198,6 +213,10 @@ class LocalizationEngine:
 
         candidate_blocks = []
         for name, block in self.blocks.items():
+            if block_filter is not None and name not in block_filter:
+                if verbose: print(f"  [Log] Skipping block {name} (not in filter)")
+                continue
+
             sim = torch.matmul(q_global, block['global_vecs'].t())
             k_scoring = min(5, sim.shape[1])
             if k_scoring > 0:
@@ -210,7 +229,6 @@ class LocalizationEngine:
         candidate_blocks.sort(key=lambda x: x[0], reverse=True)
         candidate_blocks = candidate_blocks[:3]
 
-        # 記錄 Retrieval Top 3
         for i in range(3):
             rank = i + 1
             if i < len(candidate_blocks):
@@ -281,8 +299,9 @@ class LocalizationEngine:
                 valid_3d = m_db < len(p3d_ids)
                 m_q, m_db = m_q[valid_3d], m_db[valid_3d]
                 target_ids = p3d_ids[m_db]
+                
                 has_3d = target_ids != -1
-                n_3d = has_3d.sum()
+                n_3d = int(has_3d.sum())
                 current_block_stats['matches_3d_sum'] += n_3d
                 
                 if n_3d < 4:
@@ -388,14 +407,50 @@ class LocalizationEngine:
                     print(f"    [PnP Result] Failed.")
 
                 if success and qvec is not None:
+                    # [New] 計算地圖座標
+                    map_x, map_y, map_yaw = None, None, None
+                    
+                    # 1. 計算 SfM 座標系下的位置與朝向
+                    q_scipy = colmap_to_scipy_quat(qvec)
+                    R_w2c = Rotation.from_quat(q_scipy).as_matrix()
+                    R_c2w = R_w2c.T
+                    t_vec = np.array(tvec)
+                    cam_center_sfm = -R_c2w @ t_vec
+                    view_dir = R_c2w[:, 2]
+                    sfm_yaw = np.degrees(np.arctan2(view_dir[1], view_dir[0]))
+                    
+                    # 2. 轉換到地圖座標
+                    trans = block.get('transform')
+                    if trans:
+                        s = trans['s']
+                        theta = trans['theta']
+                        t_map = trans['t']
+                        R_map = trans['R']
+                        
+                        p_sfm_2d = cam_center_sfm[:2]
+                        p_map = s * (R_map @ p_sfm_2d) + t_map
+                        map_x, map_y = float(p_map[0]), float(p_map[1])
+                        
+                        m_yaw = sfm_yaw + np.degrees(theta)
+                        map_yaw = float((m_yaw + 180) % 360 - 180)
+                    else:
+                        # 如果沒有 Anchors，則回傳 SfM 原始座標
+                        map_x, map_y = float(cam_center_sfm[0]), float(cam_center_sfm[1])
+                        map_yaw = float(sfm_yaw)
+
                     res_diag = diag.copy()
                     res_diag.update({
-                        'pnp_top1_block': block_name,  # Renamed
-                        'pnp_top1_inliers': num_inliers, # Renamed
+                        'pnp_top1_block': block_name,
+                        'pnp_top1_inliers': num_inliers,
                         'num_matches_2d': current_block_stats['matches_2d_sum'],
                         'num_matches_3d': len(p2d_concat),
                         'status': 'Success',
-                        'db_ranks': current_db_ranks 
+                        'db_ranks': current_db_ranks,
+                        
+                        # [New] 寫入 6DoF 與 Map Coordinates
+                        'pose_qw': qvec[0], 'pose_qx': qvec[1], 'pose_qy': qvec[2], 'pose_qz': qvec[3],
+                        'pose_tx': tvec[0], 'pose_ty': tvec[1], 'pose_tz': tvec[2],
+                        'map_x': map_x, 'map_y': map_y, 'map_yaw': map_yaw
                     })
                     
                     res = {
@@ -410,12 +465,10 @@ class LocalizationEngine:
             except Exception as e:
                 print(f"[Error] PnP failed for {block_name}: {e}"); continue
         
-        # [New] PnP Ranking Logic (Top 1, 2, 3)
         if valid_block_results:
             valid_block_results.sort(key=lambda x: x['inliers'], reverse=True)
             best_result = valid_block_results[0]
             
-            # PnP 2nd Place
             if len(valid_block_results) > 1:
                 second = valid_block_results[1]
                 best_result['diagnosis']['pnp_top2_inliers'] = second['inliers']
@@ -424,7 +477,6 @@ class LocalizationEngine:
                 best_result['diagnosis']['pnp_top2_inliers'] = 0
                 best_result['diagnosis']['pnp_top2_block'] = "None"
             
-            # PnP 3rd Place
             if len(valid_block_results) > 2:
                 third = valid_block_results[2]
                 best_result['diagnosis']['pnp_top3_inliers'] = third['inliers']
@@ -434,9 +486,75 @@ class LocalizationEngine:
                 best_result['diagnosis']['pnp_top3_block'] = "None"
         else:
             best_result = {'success': False, 'inliers': 0, 'diagnosis': best_fail_stats}
-            # Fill empty for failed
-            for r in ['1', '2', '3']: # Fill top1, top2, top3
+            for r in ['1', '2', '3']: 
                 best_result['diagnosis'][f'pnp_top{r}_inliers'] = 0
                 best_result['diagnosis'][f'pnp_top{r}_block'] = "None"
             
         return best_result
+
+    # [Modified] 成為 Schema 定義的唯一來源
+    def format_diagnosis(self, diag_raw: dict = None) -> dict:
+        """
+        將原始的診斷字典轉換為扁平化的報表格式。
+        如果傳入 None 或空字典，將回傳預設的空值字典（用於產生 Header）。
+        """
+        if diag_raw is None: diag_raw = {}
+
+        # 1. 決定 Rank Owner
+        rank_owner = diag_raw.get('pnp_top1_block')
+        if not rank_owner or rank_owner == 'None':
+            rank_owner = diag_raw.get('retrieval_top1', 'None')
+        
+        def fmt_rank_name(name):
+            if not name or name == 'None': return 'None'
+            return f"{rank_owner}/{name}"
+
+        # 2. 處理 db_ranks
+        ranks = diag_raw.get('db_ranks', [])
+        if ranks is None: ranks = []
+        ranks = list(ranks)
+        while len(ranks) < 3: 
+            ranks.append({'name': 'None', 'matches_2d': 0})
+
+        # 3. 定義輸出字典 (這裡也是定義 CSV 欄位順序的地方)
+        # 即使 diag_raw 為空，這裡也會根據 .get() 的預設值產生完整的字典
+        return {
+            "Status": diag_raw.get('status', 'Unknown'),
+            
+            "PnP_Top1_Block": diag_raw.get('pnp_top1_block', 'None'),
+            "PnP_Top1_Inliers": diag_raw.get('pnp_top1_inliers', 0),
+            "PnP_Top2_Block": diag_raw.get('pnp_top2_block', 'None'),
+            "PnP_Top2_Inliers": diag_raw.get('pnp_top2_inliers', 0),
+            "PnP_Top3_Block": diag_raw.get('pnp_top3_block', 'None'),
+            "PnP_Top3_Inliers": diag_raw.get('pnp_top3_inliers', 0),
+
+            "Retrieval_Top1": diag_raw.get('retrieval_top1', 'None'),
+            "Retrieval_Score1": diag_raw.get('retrieval_score1', 0.0),
+            "Retrieval_Top2": diag_raw.get('retrieval_top2', 'None'),
+            "Retrieval_Score2": diag_raw.get('retrieval_score2', 0.0),
+            "Retrieval_Top3": diag_raw.get('retrieval_top3', 'None'),
+            "Retrieval_Score3": diag_raw.get('retrieval_score3', 0.0),
+
+            "R1_Name": fmt_rank_name(ranks[0]['name']),
+            "R1_Match": ranks[0]['matches_2d'],
+            "R2_Name": fmt_rank_name(ranks[1]['name']),
+            "R2_Match": ranks[1]['matches_2d'],
+            "R3_Name": fmt_rank_name(ranks[2]['name']),
+            "R3_Match": ranks[2]['matches_2d'],
+
+            "Num_Keypoints": diag_raw.get('num_kpts', 0),
+            "Num_Matches_2D": diag_raw.get('num_matches_2d', 0),
+            "Num_Matches_3D": diag_raw.get('num_matches_3d', 0),
+            
+            # [New] 新增 Pose 與 Map 座標欄位
+            "Pose_Qw": diag_raw.get('pose_qw', ""),
+            "Pose_Qx": diag_raw.get('pose_qx', ""),
+            "Pose_Qy": diag_raw.get('pose_qy', ""),
+            "Pose_Qz": diag_raw.get('pose_qz', ""),
+            "Pose_Tx": diag_raw.get('pose_tx', ""),
+            "Pose_Ty": diag_raw.get('pose_ty', ""),
+            "Pose_Tz": diag_raw.get('pose_tz', ""),
+            "Map_X": diag_raw.get('map_x', ""),
+            "Map_Y": diag_raw.get('map_y', ""),
+            "Map_Yaw": diag_raw.get('map_yaw', "")
+        }
