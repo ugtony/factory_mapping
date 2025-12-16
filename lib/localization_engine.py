@@ -434,9 +434,10 @@ class LocalizationEngine:
                         m_yaw = sfm_yaw + np.degrees(theta)
                         map_yaw = float((m_yaw + 180) % 360 - 180)
                     else:
-                        # 如果沒有 Anchors，則回傳 SfM 原始座標
-                        map_x, map_y = float(cam_center_sfm[0]), float(cam_center_sfm[1])
-                        map_yaw = float(sfm_yaw)
+                        # 如果沒有 Anchors，則回傳 None, 不回傳 SfM 原始座標防止誤用
+                        map_x, map_y, map_yaw = None, None, None
+                        #map_x, map_y = float(cam_center_sfm[0]), float(cam_center_sfm[1])
+                        #map_yaw = float(sfm_yaw)
 
                     res_diag = diag.copy()
                     res_diag.update({
