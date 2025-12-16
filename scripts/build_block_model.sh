@@ -29,6 +29,7 @@ DEFAULT_FOV="AUTO"
 DEFAULT_GLOBAL="netvlad"
 DEFAULT_FPS=2
 DEFAULT_SEQ_WINDOW=3
+DEFAULT_INTER_FRAME_SUFFIXES=""
 
 # 2. 嘗試載入設定檔
 if [ -f "${CONFIG_FILE}" ]; then
@@ -46,6 +47,7 @@ FOV_MODEL_VAL="${FOV_MODEL:-$DEFAULT_FOV}"
 GLOBAL_CONF="${GLOBAL_CONF:-$DEFAULT_GLOBAL}"
 EXTRACT_FPS="${FPS:-$DEFAULT_FPS}"
 SEQ_WINDOW_VAL="${SEQ_WINDOW:-$DEFAULT_SEQ_WINDOW}"
+INTER_FRAME_SUFFIXES="${INTER_FRAME_SUFFIXES:-$DEFAULT_INTER_FRAME_SUFFIXES}"
 
 # 4. 解析 CLI 參數
 while [ $# -gt 0 ]; do
@@ -55,6 +57,7 @@ while [ $# -gt 0 ]; do
     --fov=*)  FOV_MODEL_VAL="${1#*=}" ;; # 允許 CLI 覆蓋 FOV
     --seq-window=*) SEQ_WINDOW_VAL="${1#*=}" ;; # 允許 CLI 覆蓋 SEQ_WINDOW
     --fps=*)  EXTRACT_FPS="${1#*=}" ;;
+    --inter-frame-suffixes=*) INTER_FRAME_SUFFIXES="${1#*=}" ;;
     --global-conf=*|--global_conf=*|--global_model=*) GLOBAL_CONF="${1#*=}" ;;
     --global-conf|--global_conf|--global_model) GLOBAL_CONF="$2"; shift ;;
     *) ;;
@@ -213,6 +216,13 @@ echo "[5] Building DB pairs..."
 if [ "${CAM_MODE}" = "360" ]; then
   echo "    > [360 Mode] Using explicit geometric pairing..."
   PAIRS_ARGS=( "--db_list" "${DB_LIST}" "--output" "${PAIRS_DB}" "--seq_window" "${SEQ_WINDOW}" )
+
+  # 若有設定 INTER_FRAME_SUFFIXES，則加入參數
+  if [ -n "${INTER_FRAME_SUFFIXES}" ]; then
+      echo "      - Backbone Strategy: Inter-frame restricted to '${INTER_FRAME_SUFFIXES}'"
+      PAIRS_ARGS+=( "--inter_frame_suffixes" "${INTER_FRAME_SUFFIXES}" )
+  fi
+
   IS_FOV_GT_90=$(awk -v f="${FOV_MODEL_VAL}" 'BEGIN {print (f > 90 ? 1 : 0)}')
   if [ "${IS_FOV_GT_90}" -eq 1 ]; then
       echo "      - FOV > 90 (${FOV_MODEL_VAL}), enabling intra-frame matching."
