@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# build_block_model.sh [V12-Configurable-SeqWindow]
+# build_block_model.sh [V13-Backbone-Strategy]
 # - Update: 支援更多影片格式 (mp4, mov, mkv, insv, etc.)
 # - Update: 自動偵測 raw/ 目錄並呼叫 extract_frames.sh 進行抽幀。
 # - Update: 使用 FOV_MODEL 作為建模視角
 # - New: 若 db 或 db_360 已有圖片，則自動跳過抽幀與 360 轉換步驟。
 # - New: 支援從 project_config.env 或 CLI (--seq-window) 設定 SEQ_WINDOW。
+# - New: 支援脊椎策略 (Backbone Strategy) 與 Intra-frame 角度過濾。
 # - Debug: set -x 開啟詳細指令輸出
 
 set -euox pipefail
 
 # -------- 0. 參數解析與設定檔讀取 --------
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=FLOAT] [--seq-window=INT] [--global-conf=STR] [--fps=FLOAT]"
+  echo "Usage: $0 <BLOCK_DATA_DIR> [--mode=std|360] [--dense] [--fov=FLOAT] [--seq-window=INT] [--global-conf=STR] [--fps=FLOAT] [--inter-frame-suffixes=STR] [--intra-max-angle=FLOAT|AUTO]"
   exit 1
 fi
 
@@ -29,7 +30,8 @@ DEFAULT_FOV="AUTO"
 DEFAULT_GLOBAL="netvlad"
 DEFAULT_FPS=2
 DEFAULT_SEQ_WINDOW=3
-DEFAULT_INTER_FRAME_SUFFIXES=""
+DEFAULT_INTER_FRAME_SUFFIXES="" # [New] 預設為空 (不啟用脊椎策略)
+DEFAULT_INTRA_MAX_ANGLE="AUTO"  # [New] 預設自動判斷角度閾值
 
 # 2. 嘗試載入設定檔
 if [ -f "${CONFIG_FILE}" ]; then
@@ -47,7 +49,10 @@ FOV_MODEL_VAL="${FOV_MODEL:-$DEFAULT_FOV}"
 GLOBAL_CONF="${GLOBAL_CONF:-$DEFAULT_GLOBAL}"
 EXTRACT_FPS="${FPS:-$DEFAULT_FPS}"
 SEQ_WINDOW_VAL="${SEQ_WINDOW:-$DEFAULT_SEQ_WINDOW}"
+
+# [New] 讀取環境變數，若無則使用預設值
 INTER_FRAME_SUFFIXES="${INTER_FRAME_SUFFIXES:-$DEFAULT_INTER_FRAME_SUFFIXES}"
+INTRA_MAX_ANGLE="${INTRA_MAX_ANGLE:-$DEFAULT_INTRA_MAX_ANGLE}"
 
 # 4. 解析 CLI 參數
 while [ $# -gt 0 ]; do
@@ -57,7 +62,8 @@ while [ $# -gt 0 ]; do
     --fov=*)  FOV_MODEL_VAL="${1#*=}" ;; # 允許 CLI 覆蓋 FOV
     --seq-window=*) SEQ_WINDOW_VAL="${1#*=}" ;; # 允許 CLI 覆蓋 SEQ_WINDOW
     --fps=*)  EXTRACT_FPS="${1#*=}" ;;
-    --inter-frame-suffixes=*) INTER_FRAME_SUFFIXES="${1#*=}" ;;
+    --inter-frame-suffixes=*) INTER_FRAME_SUFFIXES="${1#*=}" ;; # [New] CLI 覆蓋脊椎策略
+    --intra-max-angle=*) INTRA_MAX_ANGLE="${1#*=}" ;; # [New] CLI 覆蓋角度閾值
     --global-conf=*|--global_conf=*|--global_model=*) GLOBAL_CONF="${1#*=}" ;;
     --global-conf|--global_conf|--global_model) GLOBAL_CONF="$2"; shift ;;
     *) ;;
@@ -90,6 +96,11 @@ echo "[Info] Seq Window: ${SEQ_WINDOW_VAL}"
 if [ "${CAM_MODE}" = "360" ]; then
   [ "${DENSE_360}" = "1" ] && V_TYPE="Dense(8)" || V_TYPE="Sparse(4)"
   echo "[Info] 360 Settings: ${V_TYPE}, Modeling FOV=${FOV_MODEL_VAL}"
+  
+  # 顯示脊椎策略與角度設定
+  [ -n "${INTER_FRAME_SUFFIXES}" ] && MSG_BB="${INTER_FRAME_SUFFIXES}" || MSG_BB="None (All)"
+  echo "[Info] Backbone Strategy: ${MSG_BB}"
+  echo "[Info] Intra Max Angle: ${INTRA_MAX_ANGLE}"
 fi
 echo "[Info] Output: ${OUT_DIR}"
 echo "========================================"
@@ -135,7 +146,7 @@ if [ -d "${RAW_DIR}" ]; then
           TARGET_EXT_DIR="${DATA_DIR}/db"
       fi
 
-      # [New] 檢查目標資料夾是否已有圖片，若有則跳過
+      # 檢查目標資料夾是否已有圖片，若有則跳過
       HAS_IMAGES=""
       if [ -d "${TARGET_EXT_DIR}" ]; then
           HAS_IMAGES=$(find "${TARGET_EXT_DIR}" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.png" \) -print -quit)
@@ -161,7 +172,7 @@ if [ "${CAM_MODE}" = "360" ]; then
   SRC_360="${DATA_DIR}/db_360"
   DST_DB="${DATA_DIR}/db"
 
-  # [New] 檢查目標資料夾是否已有圖片，若有則跳過
+  # 檢查目標資料夾是否已有圖片，若有則跳過
   HAS_DB_IMAGES=""
   if [ -d "${DST_DB}" ]; then
       HAS_DB_IMAGES=$(find "${DST_DB}" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.png" \) -print -quit)
@@ -215,13 +226,29 @@ ${PY} -m hloc.extract_features --conf "${GLOBAL_CONF}" \
 echo "[5] Building DB pairs..."
 if [ "${CAM_MODE}" = "360" ]; then
   echo "    > [360 Mode] Using explicit geometric pairing..."
-  PAIRS_ARGS=( "--db_list" "${DB_LIST}" "--output" "${PAIRS_DB}" "--seq_window" "${SEQ_WINDOW}" )
+  
+  # [New] 智慧設定 INTRA_MAX_ANGLE
+  if [ "${INTRA_MAX_ANGLE}" = "AUTO" ]; then
+      if [ "${DENSE_360}" = "1" ]; then
+          # Dense (45 deg gap): 設 60 (允許 45, 拒絕 90)
+          INTRA_MAX_ANGLE=60
+      else
+          # Sparse (90 deg gap): 設 100 (允許 90, 拒絕 180)
+          INTRA_MAX_ANGLE=100
+      fi
+  fi
+  echo "      - Intra-frame Max Angle: ${INTRA_MAX_ANGLE}"
 
-  # 若有設定 INTER_FRAME_SUFFIXES，則加入參數
+  PAIRS_ARGS=( "--db_list" "${DB_LIST}" "--output" "${PAIRS_DB}" "--seq_window" "${SEQ_WINDOW}" )
+  
+  # [New] 傳遞脊椎策略參數
   if [ -n "${INTER_FRAME_SUFFIXES}" ]; then
       echo "      - Backbone Strategy: Inter-frame restricted to '${INTER_FRAME_SUFFIXES}'"
       PAIRS_ARGS+=( "--inter_frame_suffixes" "${INTER_FRAME_SUFFIXES}" )
   fi
+
+  # [New] 傳遞角度閾值參數
+  PAIRS_ARGS+=( "--intra_max_angle" "${INTRA_MAX_ANGLE}" )
 
   IS_FOV_GT_90=$(awk -v f="${FOV_MODEL_VAL}" 'BEGIN {print (f > 90 ? 1 : 0)}')
   if [ "${IS_FOV_GT_90}" -eq 1 ]; then
@@ -278,6 +305,7 @@ else
   rm -rf "${STAGE}"
   mkdir -p "${STAGE}"
   
+  set +x
   count=0
   while read -r rel_path; do
       [ -z "$rel_path" ] && continue
@@ -292,6 +320,7 @@ else
           count=$((count+1))
       fi
   done < "${DB_LIST}"
+  set -x
   
   echo "      - Staged ${count} images to ${STAGE}"
   IMG_DIR="${STAGE}"
