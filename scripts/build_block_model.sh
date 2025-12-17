@@ -194,7 +194,7 @@ fi
 echo "[1] Generating DB image list (db.txt)..."
 if [ ! -d "${DATA_DIR}/db" ]; then echo "[Error] ${DATA_DIR}/db not found."; exit 1; fi
 
-(cd "${DATA_DIR}" && find db -maxdepth 3 -type f \( -iname '*.jpg' -o -iname '*.png' \) | sort) > "${DB_LIST}"
+(cd "${DATA_DIR}" && find db -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.png' \) | sort) > "${DB_LIST}"
 
 if [ ! -s "${DB_LIST}" ]; then echo "[Error] No images in db/."; exit 1; fi
 echo "    > Found $(wc -l < "${DB_LIST}") DB images."
