@@ -38,7 +38,7 @@ class LocalizationEngine:
 
         self.project_root = project_root
         
-        # [Offline Fix] 設定離線模型路徑
+        # [Offline Fix] 設定離線模型路徑 (保持不變)
         CACHE_ROOT = Path("/root/.cache/torch/hub")
         SUPERPOINT_WEIGHTS = CACHE_ROOT / "checkpoints/superpoint_lightglue_v0-1_arxiv.pth"
         MEGALOC_REPO = CACHE_ROOT / "gmberton_MegaLoc_main" 
@@ -89,13 +89,17 @@ class LocalizationEngine:
         self._load_blocks(target_outputs, anchors_path)
 
     def _load_blocks(self, outputs_root, anchors_path):
-        # [Modified] 強制檢查 Anchors 檔案是否存在，若無則拋出例外
+        # [Check] 強制檢查 Anchors 檔案是否存在
         if not anchors_path.exists():
             raise FileNotFoundError(f"[Error] Anchors file missing at: {anchors_path}")
 
         with open(anchors_path, 'r') as f:
             anchors = json.load(f)
-        print(f"[Init] Loaded anchors for: {list(anchors.keys())}")
+        
+        anchors_keys = set(anchors.keys()) # Anchors 定義的 Block 名稱集合
+        print(f"[Init] Loaded anchors for: {list(anchors_keys)}")
+
+        loaded_block_names = set() # 實際載入成功的 Block 名稱集合
 
         for block_dir in outputs_root.iterdir():
             if not block_dir.is_dir(): continue
@@ -104,8 +108,12 @@ class LocalizationEngine:
             global_h5 = block_dir / f"global-{self.global_conf_name}.h5"
             local_h5_path = block_dir / "local-superpoint_aachen.h5"
             
+            # 若檔案不完整則跳過
             if not (sfm_dir/"images.bin").exists() or not global_h5.exists() or not local_h5_path.exists():
                 continue
+
+            # [New] 記錄已載入的 Block
+            loaded_block_names.add(block_dir.name)
 
             print(f"[Init] Loading Block: {block_dir.name}")
             g_names = []
@@ -148,6 +156,26 @@ class LocalizationEngine:
                 'block_root': block_dir
             }
 
+        # === [New] 交叉比對並發出警告 ===
+        # 1. 檢查 Anchors 有定義，但實際上沒有載入的模型 (可能是資料夾名稱打錯，或模型損壞/未生成)
+        missing_models = anchors_keys - loaded_block_names
+        if missing_models:
+            print("\n" + "!"*60)
+            print(f"[WARNING] The following blocks are in anchors.json but NOT loaded:")
+            for m in missing_models:
+                print(f"  - {m} (Folder missing or model corrupted?)")
+            print("!"*60 + "\n")
+
+        # 2. 檢查有模型，但 Anchors 沒定義 (可能是忘了加 Anchors，導致無法輸出的地圖座標)
+        missing_anchors = loaded_block_names - anchors_keys
+        if missing_anchors:
+            print("\n" + "?"*60)
+            print(f"[WARNING] The following blocks are loaded but NOT in anchors.json:")
+            for m in missing_anchors:
+                print(f"  - {m} (Will result in missing map coordinates)")
+            print("?"*60 + "\n")
+
+    # ... (其餘 localize 和 format_diagnosis 方法保持不變) ...
     @torch.no_grad()
     def localize(self, 
                  image_arr: np.ndarray, 
@@ -436,8 +464,6 @@ class LocalizationEngine:
                     else:
                         # 如果沒有 Anchors，則回傳 None, 不回傳 SfM 原始座標防止誤用
                         map_x, map_y, map_yaw = None, None, None
-                        #map_x, map_y = float(cam_center_sfm[0]), float(cam_center_sfm[1])
-                        #map_yaw = float(sfm_yaw)
 
                     res_diag = diag.copy()
                     res_diag.update({
@@ -493,7 +519,6 @@ class LocalizationEngine:
             
         return best_result
 
-    # [Modified] 成為 Schema 定義的唯一來源
     def format_diagnosis(self, diag_raw: dict = None) -> dict:
         """
         將原始的診斷字典轉換為扁平化的報表格式。
