@@ -25,7 +25,8 @@
         • Wheel: Zoom In/Out<br>
         • Right Drag: Pan Map<br>
         • Left Drag: Rotate View<br>
-        • Double Click: Move
+        • Click: Move (Smooth)<br>
+        • DblClick: Pick (Exact)
         </div>
     </div>
 </div>
@@ -54,6 +55,10 @@
     let panStart = { x: 0, y: 0 };
     let targetYaw = null;
     let isProcessingRotate = false;
+    
+    // Click Handling (Single vs Double)
+    let clickTimer = null;
+    let hasMoved = false; // To prevent click after drag
 
     // Viewport State
     let viewport = {
@@ -71,33 +76,23 @@
             blockLabels = data.block_labels;
             
             console.log(`Loaded ${cameras.length} cameras.`);
-
-            // Setup Canvas size
             setupCanvas();
-            
-            // Calculate initial fit
             fitMapToScreen();
             
             document.getElementById('loadingMsg').style.display = 'none';
             
-            // [Fix] Force select the first camera if available
             if (cameras.length > 0) {
-                console.log("Selecting initial camera: 0");
                 updateView(0);
                 anchorIdx = 0;
-            } else {
-                console.warn("No cameras loaded!");
             }
 
             drawLoop();
 
-            // Load points in background
             fetch('/api/scene_points').then(r => r.json()).then(pts => {
                 scenePoints = pts;
                 drawLoop();
             });
 
-            // [Fix] Double-check layout after a short delay to fix misalignment
             setTimeout(() => {
                 setupCanvas();
                 fitMapToScreen();
@@ -125,7 +120,6 @@
         const mapW = maxX - minX;
         const mapH = maxY - minY;
         
-        // Prevent division by zero
         if (mapW === 0 || mapH === 0) return;
 
         const scaleX = canvas.width / mapW;
@@ -184,31 +178,29 @@
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         if (!viewport.scale) return;
 
-        // 1. Scene (修改這裡！)
-        // 原本是 '#ddd', 改深一點變成 '#666' 或 '#444'
+        // Scene Points
         ctx.fillStyle = '#AAA'; 
-        
         for (let p of scenePoints) {
             const s = worldToScreen(p.x, p.y);
-            // Only draw if within bounds (Optimization)
             if (s.x > 0 && s.x < canvas.width && s.y > 0 && s.y < canvas.height) {
-                // 原本是 fillRect(s.x, s.y, 1, 1), 改大一點變成 2, 2
                 ctx.fillRect(s.x, s.y, 2, 2);
             }
         }
 
         // Cameras
-        const arrowLen = config.visual_scale * viewport.scale * 0.8;
+        // [MODIFIED] Reduced arrow length from 0.8 to 0.55
+        const arrowLen = config.visual_scale * viewport.scale * 0.55;
+        
         for (let cam of cameras) {
             const s = worldToScreen(cam.x, cam.y);
-            // Culling
             if (s.x < -50 || s.x > canvas.width+50 || s.y < -50 || s.y > canvas.height+50) continue;
 
             ctx.beginPath();
             ctx.arc(s.x, s.y, 3, 0, 2 * Math.PI);
             ctx.fillStyle = cam.color;
             ctx.fill();
-            drawArrow(ctx, s.x, s.y, cam.yaw, arrowLen, cam.color, 1);
+            // [MODIFIED] Slightly thicker arrow for visibility
+            drawArrow(ctx, s.x, s.y, cam.yaw, arrowLen, cam.color, 1.5);
         }
 
         // Labels
@@ -263,18 +255,33 @@
         currentCamIdx = idx;
         const cam = cameras[idx];
         
-        console.log(`Switching to camera ${idx}: [${cam.block}] ${cam.name}`);
-        
-        // Update Image Source
-        imgElement.onload = () => { console.log("Image loaded successfully"); };
-        imgElement.onerror = () => { 
-            console.error("Failed to load image"); 
-            imgInfo.innerText += " (Load Failed)";
-        };
+        // Update Image
+        imgElement.onload = () => { console.log("Image loaded."); };
+        imgElement.onerror = () => { imgInfo.innerText += " (Load Failed)"; };
         imgElement.src = `/api/image/${idx}`;
         imgInfo.innerText = `[${cam.block}] ${cam.name}`;
         
         drawLoop();
+    }
+    
+    // Unified Move Function
+    async function triggerMove(sx, sy, mode) {
+        const w = screenToWorld(sx, sy);
+        const res = await fetch('/api/action/move', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                target_x: w.x,
+                target_y: w.y,
+                current_idx: currentCamIdx,
+                mode: mode // "smooth" or "nearest"
+            })
+        });
+        const bestCam = await res.json();
+        if (bestCam && bestCam.id !== undefined) {
+            updateView(bestCam.id);
+            anchorIdx = bestCam.id;
+        }
     }
 
     // --- Event Listeners ---
@@ -292,7 +299,6 @@
         const wy_rel = (canvas.height - my - viewport.offsetY) / viewport.scale;
 
         const newScale = viewport.scale * zoomFactor;
-        
         viewport.offsetX = mx - wx_rel * newScale;
         viewport.offsetY = canvas.height - my - wy_rel * newScale;
         viewport.scale = newScale;
@@ -302,6 +308,7 @@
     canvas.addEventListener('contextmenu', e => e.preventDefault());
 
     canvas.addEventListener('mousedown', (e) => {
+        hasMoved = false; // Reset drag flag
         if (e.button === 0) { 
             isRotating = true;
             anchorIdx = currentCamIdx;
@@ -323,6 +330,11 @@
     });
 
     canvas.addEventListener('mousemove', async (e) => {
+        // Detect Drag for Click Cancellation
+        if (isPanning || isRotating) {
+            hasMoved = true;
+        }
+
         if (isPanning) {
             const dx = e.clientX - panStart.x;
             const dy = e.clientY - panStart.y;
@@ -336,10 +348,8 @@
         if (isRotating) {
             if (isProcessingRotate) return;
             isProcessingRotate = true;
-
             const rect = canvas.getBoundingClientRect();
             const w = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
-            
             try {
                 const res = await fetch('/api/action/rotate', {
                     method: 'POST',
@@ -363,23 +373,29 @@
         }
     });
 
-    canvas.addEventListener('dblclick', async (e) => {
-        const rect = canvas.getBoundingClientRect();
-        const w = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    // [MODIFIED] Click Logic: Timer to separate Single vs Double click
+    canvas.addEventListener('click', (e) => {
+        if (hasMoved) return; // Ignore clicks if dragging happened
         
-        const res = await fetch('/api/action/move', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                target_x: w.x,
-                target_y: w.y,
-                current_idx: currentCamIdx
-            })
-        });
-        const bestCam = await res.json();
-        if (bestCam && bestCam.id !== undefined) {
-            updateView(bestCam.id);
-            anchorIdx = bestCam.id;
+        const rect = canvas.getBoundingClientRect();
+        const sx = e.clientX - rect.left;
+        const sy = e.clientY - rect.top;
+
+        if (clickTimer) {
+            // == Double Click detected ==
+            clearTimeout(clickTimer);
+            clickTimer = null;
+            // Execute Nearest Mode
+            console.log("Action: Double Click (Nearest)");
+            triggerMove(sx, sy, "nearest");
+        } else {
+            // == Start Timer for Single Click ==
+            clickTimer = setTimeout(() => {
+                clickTimer = null;
+                // Execute Smooth Mode
+                console.log("Action: Single Click (Smooth)");
+                triggerMove(sx, sy, "smooth");
+            }, 250); // 250ms delay
         }
     });
 

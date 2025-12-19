@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-web_visualizer.py (Separated HTML version)
+web_visualizer.py
+Updated: 
+1. Relaxed "Smooth" mode: considers distance within local radius to allow slight rotation.
+2. Dual Move Logic: 'smooth' (Single Click) vs 'nearest' (Double Click).
+3. Auto-detection of anchors.json path & Consistency checks.
 """
 import uvicorn
 from fastapi import FastAPI
@@ -76,6 +80,7 @@ class MoveRequest(BaseModel):
     target_x: float
     target_y: float
     current_idx: int
+    mode: str = "smooth"  # "smooth" (Single Click) or "nearest" (Double Click)
 
 class RotateRequest(BaseModel):
     anchor_idx: int
@@ -86,8 +91,23 @@ class RotateRequest(BaseModel):
 def load_data(anchors_path: Path, image_root: Path):
     global all_cameras, scene_points, config, block_labels
     
+    if not anchors_path.exists():
+        print(f"[Error] Anchors file not found: {anchors_path}")
+        return
+
     with open(anchors_path, 'r') as f:
         anchors_cfg = json.load(f)
+
+    # --- Check 1: Disk -> Config Consistency ---
+    if image_root.exists():
+        disk_dirs = {p.name for p in image_root.iterdir() if p.is_dir() and not p.name.startswith(".")}
+        config_keys = set(anchors_cfg.keys())
+        unconfigured = disk_dirs - config_keys
+        if unconfigured:
+            print(f"\n[Warning] Found {len(unconfigured)} folders in '{image_root}' NOT in anchors.json:")
+            for b in sorted(unconfigured):
+                print(f"  - {b} (Unconfigured)")
+            print("-" * 50)
 
     temp_points = []
     all_cameras = []
@@ -97,16 +117,23 @@ def load_data(anchors_path: Path, image_root: Path):
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", 
               "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
-    print(f"[Init] Loading {len(anchors_cfg)} blocks...")
+    print(f"[Init] Loading {len(anchors_cfg)} blocks from config...")
 
     for i, (block_name, cfg) in enumerate(anchors_cfg.items()):
         sfm_path = Path(cfg['sfm_path'])
         if not sfm_path.exists(): sfm_path = project_root / cfg['sfm_path']
-        if not (sfm_path / "images.bin").exists(): continue
+        
+        # --- Check 2: Config -> Disk Consistency ---
+        if not (sfm_path / "images.bin").exists():
+            print(f"[Warning] Block '{block_name}' in anchors but MISSING model data at: {sfm_path}")
+            continue
 
         recon = pycolmap.Reconstruction(sfm_path)
         trans = compute_sim2_transform(recon, cfg)
-        if trans is None: continue
+        
+        if trans is None: 
+            print(f"[Warning] Block '{block_name}' failed to compute Sim2 transform.")
+            continue
             
         hex_color = colors[i % len(colors)]
         block_sums[block_name] = {'x': 0.0, 'y': 0.0, 'count': 0}
@@ -211,30 +238,34 @@ async def get_scene_points():
 @app.get("/api/image/{cam_id}")
 async def get_image(cam_id: int):
     if cam_id < 0 or cam_id >= len(all_cameras):
-        print(f"[Debug] Camera ID {cam_id} out of range (Total: {len(all_cameras)})")
         return JSONResponse(status_code=404, content={"error": "Camera not found"})
     
     path_str = all_cameras[cam_id]['file_path']
     path = Path(path_str)
     
     if not path_str:
-        print(f"[Debug] Camera {cam_id} has empty file path")
         return JSONResponse(status_code=404, content={"error": "Image path empty"})
 
     if path.exists():
-        # print(f"[Debug] Serving image: {path}") # 成功時不一定要印，免得洗版
         return FileResponse(path)
     else:
-        print(f"[Debug] Image file missing: {path}")
         return JSONResponse(status_code=404, content={"error": "Image file missing"})
 
 @app.post("/api/action/move")
 async def action_move(req: MoveRequest):
     if not all_cameras: return {}
-    current_yaw = all_cameras[req.current_idx]['yaw']
+    
     centers = np.array([[c['x'], c['y']] for c in all_cameras])
     target_arr = np.array([req.target_x, req.target_y])
     dists = np.linalg.norm(centers - target_arr, axis=1)
+
+    # 模式 A: 雙擊 = 絕對最近 (Nearest, Hit-Box Logic)
+    if req.mode == "nearest":
+        nearest_idx = np.argmin(dists)
+        return all_cameras[nearest_idx]
+
+    # 模式 B: 單點 = 平滑導航 (Smooth with Relaxed Angle)
+    current_yaw = all_cameras[req.current_idx]['yaw']
     
     K = 15
     nearest_indices = np.argsort(dists)[:K]
@@ -244,9 +275,20 @@ async def action_move(req: MoveRequest):
     for idx in nearest_indices:
         idx = int(idx)
         cam = all_cameras[idx]
+        
+        # --- 權重設定 ---
+        # 1. 角度差異 (Base cost)
         a_dist = angle_diff(cam['yaw'], current_yaw)
-        dist_penalty = 0.0 if dists[idx] <= 5.0 else 10.0
-        score = a_dist + dist_penalty
+        
+        # 2. 距離權重 (0.2 means 1 meter distance cost ~= 11.5 degrees rotation cost)
+        # 這讓近處的照片比較容易被選中，即使角度稍微不正
+        dist_cost = dists[idx] * 0.2
+        
+        # 3. 過遠懲罰 (避免單點一下跳去地圖另一端)
+        penalty = 0.0 if dists[idx] <= 6.0 else 10.0
+        
+        score = a_dist + dist_cost + penalty
+        
         if score < min_score:
             min_score = score
             best_idx = idx
@@ -281,12 +323,8 @@ async def action_rotate(req: RotateRequest):
 # ==================== Main ====================
 @app.get("/")
 async def get_index():
-    # 讀取分離的 template 檔案
-    # 假設 templates/index.html 在 web_visualizer.py 同層的 web/templates 或 ./templates
-    # 這裡假設使用者是 python web/web_visualizer.py 執行，相對路徑如下：
     template_path = Path("web/templates/index.html")
     if not template_path.exists():
-         # Fallback check
          template_path = Path("templates/index.html")
     
     if template_path.exists():
@@ -297,9 +335,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--anchors", type=Path, default="anchors.json")
+    parser.add_argument("--anchors", type=Path, default=None)
     parser.add_argument("--image_root", type=Path, default="outputs-hloc")
     args = parser.parse_args()
+
+    if args.anchors is None:
+        args.anchors = args.image_root / "anchors.json"
+
+    if not args.anchors.exists():
+        print(f"[Warning] Anchors file not found at: {args.anchors}")
+        print(f"          Please ensure anchors.json exists in {args.image_root} or specify --anchors.")
 
     load_data(args.anchors, args.image_root)
     
