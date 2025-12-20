@@ -97,83 +97,101 @@ class LocalizationEngine:
             anchors = json.load(f)
         
         anchors_keys = set(anchors.keys()) # Anchors 定義的 Block 名稱集合
-        print(f"[Init] Loaded anchors for: {list(anchors_keys)}")
+        print(f"[Init] Anchors defined for: {list(anchors_keys)}")
 
-        loaded_block_names = set() # 實際載入成功的 Block 名稱集合
+        # 1. 先找出所有實體存在的資料夾，用於偵測「有模型但沒 Anchor」的情況
+        physical_block_names = set()
+        if outputs_root.exists():
+            physical_block_names = {p.name for p in outputs_root.iterdir() if p.is_dir()}
 
-        for block_dir in outputs_root.iterdir():
-            if not block_dir.is_dir(): continue
+        # 2. [Warning B] 模型檔在但 Anchor 沒定義 (Orphaned Blocks)
+        # 這些 Block 不會被載入，因為我們只載入 Anchors 有定義的
+        orphaned_blocks = physical_block_names - anchors_keys
+        if orphaned_blocks:
+            print("\n" + "?"*60)
+            print(f"[WARNING] The following blocks exist on disk but are NOT in anchors.json:")
+            for m in orphaned_blocks:
+                print(f"  - {m} (Skipped loading)")
+            print("?"*60 + "\n")
+
+        # 3. 只針對 Anchors 有定義的 Block 嘗試載入
+        failed_blocks = [] # 用於記錄「有定義但讀不到」的情況
+
+        for block_name in anchors_keys:
+            block_dir = outputs_root / block_name
+            
+            # 若實體資料夾根本不存在
+            if not block_dir.exists():
+                failed_blocks.append(f"{block_name} (Directory not found)")
+                continue
+
             sfm_dir = block_dir / "sfm_aligned"
             if not (sfm_dir / "images.bin").exists(): sfm_dir = block_dir / "sfm"
+            
             global_h5 = block_dir / f"global-{self.global_conf_name}.h5"
             local_h5_path = block_dir / "local-superpoint_aachen.h5"
             
-            # 若檔案不完整則跳過
+            # 若關鍵檔案不完整
             if not (sfm_dir/"images.bin").exists() or not global_h5.exists() or not local_h5_path.exists():
+                failed_blocks.append(f"{block_name} (Missing SFM or H5 files)")
                 continue
 
-            # [New] 記錄已載入的 Block
-            loaded_block_names.add(block_dir.name)
-
-            print(f"[Init] Loading Block: {block_dir.name}")
-            g_names = []
-            g_vecs = []
-            with h5py.File(global_h5, 'r') as f:
-                def visit(name, obj):
-                    if isinstance(obj, h5py.Group) and 'global_descriptor' in obj:
-                        g_names.append(name)
-                        g_vecs.append(obj['global_descriptor'].__array__())
-                f.visititems(visit)
-            
-            if not g_vecs: continue
-            g_vecs = torch.from_numpy(np.array(g_vecs)).to(self.device).squeeze()
-            if g_vecs.ndim == 1: g_vecs = g_vecs.unsqueeze(0)
-
+            # 開始載入
+            print(f"[Init] Loading Block: {block_name}")
             try:
+                g_names = []
+                g_vecs = []
+                with h5py.File(global_h5, 'r') as f:
+                    def visit(name, obj):
+                        if isinstance(obj, h5py.Group) and 'global_descriptor' in obj:
+                            g_names.append(name)
+                            g_vecs.append(obj['global_descriptor'].__array__())
+                    f.visititems(visit)
+                
+                if not g_vecs: 
+                    failed_blocks.append(f"{block_name} (Global descriptors empty)")
+                    continue
+
+                g_vecs = torch.from_numpy(np.array(g_vecs)).to(self.device).squeeze()
+                if g_vecs.ndim == 1: g_vecs = g_vecs.unsqueeze(0)
+
                 recon = pycolmap.Reconstruction(sfm_dir)
                 name_to_id = {img.name: img_id for img_id, img in recon.images.items()}
-            except Exception as e:
-                print(f"    [Error] Failed to load SfM: {e}"); continue
-            
-            transform = None
-            if block_dir.name in anchors:
+                
+                # 計算座標轉換 (既然在 anchors 列表內，anchors[block_name] 一定存在)
+                transform = None
                 try:
-                    transform = compute_sim2_transform(recon, anchors[block_dir.name])
+                    transform = compute_sim2_transform(recon, anchors[block_name])
                     if transform:
                         s = transform['s']
                         theta_deg = np.degrees(transform['theta'])
                         print(f"    > Aligned: Scale={s:.4f}, Rot={theta_deg:.2f}°")
-                except: pass
+                    else:
+                        print(f"    > [Warn] Failed to compute Sim2 transform for {block_name}")
+                except Exception as e:
+                    print(f"    > [Warn] Transform error: {e}")
 
-            self.blocks[block_dir.name] = {
-                'recon': recon,
-                'name_to_id': name_to_id,
-                'global_names': g_names,
-                'global_vecs': g_vecs,
-                'local_h5_path': local_h5_path,
-                'local_h5': h5py.File(local_h5_path, 'r'),
-                'transform': transform,
-                'block_root': block_dir
-            }
+                self.blocks[block_name] = {
+                    'recon': recon,
+                    'name_to_id': name_to_id,
+                    'global_names': g_names,
+                    'global_vecs': g_vecs,
+                    'local_h5_path': local_h5_path,
+                    'local_h5': h5py.File(local_h5_path, 'r'),
+                    'transform': transform,
+                    'block_root': block_dir
+                }
 
-        # === [New] 交叉比對並發出警告 ===
-        # 1. 檢查 Anchors 有定義，但實際上沒有載入的模型 (可能是資料夾名稱打錯，或模型損壞/未生成)
-        missing_models = anchors_keys - loaded_block_names
-        if missing_models:
+            except Exception as e:
+                failed_blocks.append(f"{block_name} (Load Exception: {e})")
+
+        # 4. [Warning A] Anchor 有定義但讀不到/載入失敗
+        if failed_blocks:
             print("\n" + "!"*60)
-            print(f"[WARNING] The following blocks are in anchors.json but NOT loaded:")
-            for m in missing_models:
-                print(f"  - {m} (Folder missing or model corrupted?)")
+            print(f"[WARNING] The following blocks are defined in Anchors but FAILED to load:")
+            for msg in failed_blocks:
+                print(f"  - {msg}")
             print("!"*60 + "\n")
-
-        # 2. 檢查有模型，但 Anchors 沒定義 (可能是忘了加 Anchors，導致無法輸出的地圖座標)
-        missing_anchors = loaded_block_names - anchors_keys
-        if missing_anchors:
-            print("\n" + "?"*60)
-            print(f"[WARNING] The following blocks are loaded but NOT in anchors.json:")
-            for m in missing_anchors:
-                print(f"  - {m} (Will result in missing map coordinates)")
-            print("?"*60 + "\n")
 
     # ... (其餘 localize 和 format_diagnosis 方法保持不變) ...
     @torch.no_grad()
