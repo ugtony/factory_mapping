@@ -5,6 +5,7 @@ Updated:
 1. Relaxed "Smooth" mode: considers distance within local radius to allow slight rotation.
 2. Dual Move Logic: 'smooth' (Single Click) vs 'nearest' (Double Click).
 3. Auto-detection of anchors.json path & Consistency checks.
+4. [Fix] Removed dependency on 'sfm_path' in anchors.json (Auto-inference).
 """
 import uvicorn
 from fastapi import FastAPI
@@ -120,15 +121,25 @@ def load_data(anchors_path: Path, image_root: Path):
     print(f"[Init] Loading {len(anchors_cfg)} blocks from config...")
 
     for i, (block_name, cfg) in enumerate(anchors_cfg.items()):
-        sfm_path = Path(cfg['sfm_path'])
-        if not sfm_path.exists(): sfm_path = project_root / cfg['sfm_path']
+        # [Modified] 自動推斷 SfM 路徑，不再依賴 cfg['sfm_path']
+        block_dir = image_root / block_name
+        sfm_path = block_dir / "sfm_aligned"
+        
+        # Fallback to 'sfm' if 'sfm_aligned' is missing/incomplete
+        if not (sfm_path / "images.bin").exists():
+            sfm_path = block_dir / "sfm"
         
         # --- Check 2: Config -> Disk Consistency ---
         if not (sfm_path / "images.bin").exists():
-            print(f"[Warning] Block '{block_name}' in anchors but MISSING model data at: {sfm_path}")
+            print(f"[Warning] Block '{block_name}' defined in anchors but MISSING model data at: {sfm_path}")
             continue
 
-        recon = pycolmap.Reconstruction(sfm_path)
+        try:
+            recon = pycolmap.Reconstruction(sfm_path)
+        except Exception as e:
+            print(f"[Error] Failed to load SfM for '{block_name}': {e}")
+            continue
+
         trans = compute_sim2_transform(recon, cfg)
         
         if trans is None: 
