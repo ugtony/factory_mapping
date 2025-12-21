@@ -1,31 +1,46 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-scripts/pairs_from_360.py
-[Modified V4] 
-1. 參數命名：Axial/Diagonal/Lateral。
-2. 預設策略調整：Lateral 預設為 1 (允許相鄰連接)，Intra 預設開啟 (Angle=90)。
-3. 簡化參數：移除 --intra_match，改由 angle=0 控制關閉。
+scripts/pairs_from_360_v6.py
+[Final Version]
+1. 嚴格對應 User 定義的 VIEW_ANGLES (LF = -45)。
+2. 實作完整的左右兩側輸送帶策略 (Cross-Over Strategy)。
+3. 針對長廊場景優化：F->LF->L... 與 F->FR->R...
 """
 import argparse
 from pathlib import Path
 from collections import defaultdict
 import sys
 
-# 定義視角與角度的對應關係
+# === [1. 嚴格定義視角] ===
+# 依據您提供的轉換程式定義
 VIEW_ANGLES = {
     'F': 0,   'FR': 45,  'R': 90,  'RB': 135,
     'B': 180, 'BL': -135,'L': -90, 'LF': -45
 }
 
-# === [視角分組定義] ===
-# Axial (軸向): 沿著移動路徑前後，視差變化最顯著，用於鎖定軌跡 (Spine)。
+# === [2. 視角功能分組] ===
 VIEWS_AXIAL   = {'F', 'B'} 
-
-# Lateral (側向): 垂直於移動路徑，易受重複紋理影響。
 VIEWS_LATERAL = {'L', 'R'}
 
-# Diagonal (對角): 其餘視角 (FR, FL, RB, LB)，作為輔助約束。
+# === [3. 輸送帶流動規則 (Cross-Over Rules)] ===
+# 邏輯：當相機前進 (t -> t+1) 時，物體在視野中的流動方向
+# Key: 當前幀視角 (t) -> Value: 下一幀目標視角列表 (t+1)
+CROSS_OVER_RULES = {
+    # --- 起始點 (F) ---
+    # F 同時流向左右兩邊 (分裂)
+    'F':  ['FR', 'LF'],
+    
+    # --- 右側鏈 (Clockwise: 0 -> 45 -> 90 -> 135 -> 180) ---
+    'FR': ['R'],       # 右前 -> 正右 (關鍵抗重複)
+    'R':  ['RB'],      # 正右 -> 右後 (關鍵抗重複)
+    'RB': ['B'],       # 右後 -> 正後
+    
+    # --- 左側鏈 (Counter-Clockwise: 0 -> -45 -> -90 -> -135 -> 180) ---
+    'LF': ['L'],       # 左前 -> 正左 (關鍵抗重複)
+    'L':  ['BL'],      # 正左 -> 左後 (關鍵抗重複)
+    'BL': ['B']        # 左後 -> 正後
+}
 
 def get_angle_diff(suffix1, suffix2):
     """計算兩個後綴對應的角度差 (最小夾角)"""
@@ -40,48 +55,44 @@ def get_angle_diff(suffix1, suffix2):
     return diff
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate pairs with Directional Window Strategy.")
+    parser = argparse.ArgumentParser(description="Generate pairs with Directional Window + Cross-Over Strategy.")
     parser.add_argument("--db_list", required=True, help="Path to HLOC db image list")
     parser.add_argument("--output", required=True, help="Output pairs file path")
     
-    # [Directional Window Strategy Config]
-    # 1. Axial (F, B): 負責主要的縱向位移估計
-    parser.add_argument("--window_axial", type=int, default=5, 
-                        help="Window size for Axial views (F, B). Default: 5")
+    # [Directional Window Strategy]
+    parser.add_argument("--window_axial", type=int, default=3, 
+                        help="Window size for Axial views (F, B). Default: 3")
     
-    # 2. Diagonal (FR, FL...): 負責輔助連接
-    parser.add_argument("--window_diagonal", type=int, default=-1, 
-                        help="Window size for Diagonal views. Default: -1 (Auto = axial // 2)")
+    parser.add_argument("--window_diagonal", type=int, default=1, 
+                        help="Window size for Diagonal views (FR, LF, RB, BL). Default: 1")
     
-    # 3. Lateral (L, R): 側向視角
-    # [Mod V4] 預設改為 1 (允許與正隔壁幀連接，但不延伸)
-    parser.add_argument("--window_lateral", type=int, default=1, 
-                        help="Window size for Lateral views (L, R). Default: 1")
+    parser.add_argument("--window_lateral", type=int, default=0, 
+                        help="Window size for Lateral views (L, R). Default: 0")
 
-    # [Intra-frame Config]
-    # [Mod V4] 移除 --intra_match，改由 angle 控制 (設為 0 即關閉)
-    # [Mod V4] 預設改為 90 (允許 F-R 直接連接，增加剛性)
-    parser.add_argument("--intra_max_angle", type=float, default=90.0, 
-                        help="Max angular difference for intra-frame pairs. Set 0 to disable. (Default: 90)")
+    # [Intra-frame Strategy]
+    parser.add_argument("--intra_max_angle", type=float, default=45.0, 
+                        help="Max angular difference for intra-frame pairs. Set 0 to disable.")
+
+    # [Cross-Over Strategy]
+    parser.add_argument("--enable_cross_over", action="store_true", 
+                        help="Enable Cross-Over matching (e.g., LF_t -> L_t+1). Essential for corridors.")
 
     args = parser.parse_args()
 
-    # 參數解析與預設值邏輯
+    # 參數處理
     win_axial = args.window_axial
     win_diag  = args.window_diagonal if args.window_diagonal >= 0 else (win_axial // 2)
     win_lat   = args.window_lateral
-    
-    # 判斷 Intra-frame 狀態
     is_intra_enabled = args.intra_max_angle > 0
+    is_crossover_enabled = args.enable_cross_over
     
     print("========================================")
-    print(f"[Config] Directional Window Strategy:")
-    print(f"  - Axial    (F, B)         : Window = {win_axial}")
-    print(f"  - Diagonal (FR, FL, etc.) : Window = {win_diag}")
-    print(f"  - Lateral  (L, R)         : Window = {win_lat}")
-    print(f"[Config] Intra-frame Strategy:")
-    print(f"  - Enabled                 : {is_intra_enabled}")
-    print(f"  - Max Angle               : {args.intra_max_angle}°")
+    print(f"[Config] View Strategy:")
+    print(f"  - Axial Window (F, B) : {win_axial}")
+    print(f"  - Diag Window (LF,FR) : {win_diag}")
+    print(f"  - Lat Window (L, R)   : {win_lat} (Suggest 0 for tiles)")
+    print(f"  - Intra-frame Match   : {'ON' if is_intra_enabled else 'OFF'}")
+    print(f"  - Cross-Over Flow     : {'ON' if is_crossover_enabled else 'OFF'} (Crucial!)")
     print("========================================")
 
     db_list_path = Path(args.db_list)
@@ -89,11 +100,10 @@ def main():
         print(f"[Error] DB list not found: {db_list_path}", file=sys.stderr)
         sys.exit(1)
 
-    # 1. Read DB List
+    # 1. 讀取與解析影像列表
     with open(db_list_path, 'r') as f:
         images = [line.strip() for line in f if line.strip()]
 
-    # 2. Parse Frames
     frame_dict = defaultdict(dict)
     timestamps = []
 
@@ -102,27 +112,28 @@ def main():
         parts = stem.split('_')
         if len(parts) < 2: continue
         
-        view = parts[-1]
+        # 取得最後一個 part 作為視角 (例如 LF)
+        # 因為您的程式產生的一定是正確的大小寫，這裡直接比對
+        view = parts[-1] 
         frame_id = "_".join(parts[:-1])
         
-        frame_dict[frame_id][view] = img_path
-        if frame_id not in timestamps:
-            timestamps.append(frame_id)
+        if view in VIEW_ANGLES:
+            frame_dict[frame_id][view] = img_path
+            if frame_id not in timestamps:
+                timestamps.append(frame_id)
             
     timestamps.sort()
     print(f"[Info] Found {len(timestamps)} frames.")
 
     pairs = []
-    intra_count = 0
-    inter_count = 0
+    stats = {'intra': 0, 'inter_same': 0, 'inter_cross': 0}
 
-    # 3. Generate Pairs
+    # 2. 生成配對
     for i, t_curr in enumerate(timestamps):
         views_curr = frame_dict[t_curr]
         view_keys = sorted(list(views_curr.keys()))
         
-        # (A) Intra-frame: Geometric Filtering
-        # 只要 angle > 0 且有多個視角，就嘗試連接
+        # (A) Intra-frame: 幾何剛體連接
         if is_intra_enabled and len(view_keys) > 1:
             for v1_idx in range(len(view_keys)):
                 for v2_idx in range(v1_idx + 1, len(view_keys)):
@@ -132,43 +143,59 @@ def main():
                     diff = get_angle_diff(v1, v2)
                     if diff <= args.intra_max_angle:
                         pairs.append((views_curr[v1], views_curr[v2]))
-                        intra_count += 1
+                        stats['intra'] += 1
 
-        # (B) Inter-frame: Directional Window Strategy
+        # (B) Inter-frame: 同視角連接 (Same View)
         for view_type in views_curr:
-            # 根據視角方向決定 Window Size
-            current_window = 0
-            
+            # 決定 Window 大小
             if view_type in VIEWS_AXIAL:
-                current_window = win_axial
+                c_win = win_axial
             elif view_type in VIEWS_LATERAL:
-                current_window = win_lat
+                c_win = win_lat
             else:
-                current_window = win_diag # 其餘皆為 Diagonal
+                c_win = win_diag 
             
-            # 若 window <= 0，則跳過此視角的 Inter-frame
-            if current_window <= 0:
-                continue
+            if c_win > 0:
+                for j in range(1, c_win + 1):
+                    if i + j >= len(timestamps): break
+                    t_next = timestamps[i+j]
+                    views_next = frame_dict[t_next]
+                    
+                    if view_type in views_next:
+                        pairs.append((views_curr[view_type], views_next[view_type]))
+                        stats['inter_same'] += 1
 
-            # 執行時間序列配對
-            for j in range(1, current_window + 1):
-                if i + j >= len(timestamps): break
-                t_next = timestamps[i+j]
+        # (C) Inter-frame: 輸送帶流動 (Cross-Over)
+        if is_crossover_enabled:
+            # 只看 t+1 (假設步距 1m, 流動最明顯發生在下一幀)
+            if i + 1 < len(timestamps):
+                t_next = timestamps[i+1]
                 views_next = frame_dict[t_next]
-                
-                if view_type in views_next:
-                    pairs.append((views_curr[view_type], views_next[view_type]))
-                    inter_count += 1
 
-    # 4. Output
+                # 遍歷當前擁有的視角
+                for v_curr in views_curr:
+                    # 如果這個視角在規則中有定義流向 (例如 F -> [FR, LF])
+                    if v_curr in CROSS_OVER_RULES:
+                        target_list = CROSS_OVER_RULES[v_curr]
+                        
+                        for v_target in target_list:
+                            # 如果下一幀有捕捉到這個目標視角
+                            if v_target in views_next:
+                                pairs.append((views_curr[v_curr], views_next[v_target]))
+                                stats['inter_cross'] += 1
+
+    # 3. 輸出結果
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, 'w') as f:
         for p1, p2 in pairs:
             f.write(f"{p1} {p2}\n")
             
-    print(f"[Success] Pairs: {len(pairs)} (Intra: {intra_count}, Inter: {inter_count})")
-    print(f"          Output saved to {output_path}")
+    print(f"[Success] Pairs Generated: {len(pairs)}")
+    print(f"  - Intra-frame      : {stats['intra']}")
+    print(f"  - Same-View Inter  : {stats['inter_same']}")
+    print(f"  - Cross-Over Flow  : {stats['inter_cross']}")
+    print(f"Output saved to {output_path}")
 
 if __name__ == "__main__":
     main()

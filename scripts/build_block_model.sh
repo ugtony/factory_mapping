@@ -39,6 +39,7 @@ DEFAULT_WIN_AXIAL=5
 DEFAULT_WIN_DIAGONAL=-1
 DEFAULT_WIN_LATERAL=1
 DEFAULT_INTRA_ANGLE=90.0
+DEFAULT_CROSS_OVER=1
 
 # 2. 載入設定檔
 if [ -f "${CONFIG_FILE}" ]; then
@@ -55,6 +56,7 @@ WIN_AXIAL="${WINDOW_AXIAL:-$DEFAULT_WIN_AXIAL}"
 WIN_DIAGONAL="${WINDOW_DIAGONAL:-$DEFAULT_WIN_DIAGONAL}"
 WIN_LATERAL="${WINDOW_LATERAL:-$DEFAULT_WIN_LATERAL}"
 INTRA_ANGLE="${INTRA_MAX_ANGLE:-$DEFAULT_INTRA_ANGLE}"
+CROSS_OVER="${ENABLE_CROSS_OVER:-$DEFAULT_CROSS_OVER}"
 
 # 4. 解析 CLI 參數
 while [ $# -gt 0 ]; do
@@ -67,6 +69,7 @@ while [ $# -gt 0 ]; do
     --window-diagonal=*) WIN_DIAGONAL="${1#*=}" ;;
     --window-lateral=*)  WIN_LATERAL="${1#*=}" ;;
     --intra-max-angle=*) INTRA_ANGLE="${1#*=}" ;;
+    --enable-cross-over=*) CROSS_OVER="${1#*=}" ;;
 
     --global-conf=*|--global_model=*) GLOBAL_CONF="${1#*=}" ;;
     *) ;;
@@ -204,6 +207,11 @@ PAIRS_ARGS=( \
   "--window_lateral" "${WIN_LATERAL}" \
   "--intra_max_angle" "${INTRA_ANGLE}" \
 )
+
+if [ "${CROSS_OVER}" = "1" ]; then
+    PAIRS_ARGS+=( "--enable_cross_over" )
+fi
+
 "${PY}" "${PAIRS_360_SCRIPT}" "${PAIRS_ARGS[@]}"
 
 echo "[6] Cleaning pairs list..."
