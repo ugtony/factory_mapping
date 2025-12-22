@@ -48,7 +48,8 @@ RUN pip install --upgrade pip setuptools wheel && \
     fastapi \
     uvicorn \
     python-multipart \
-    scipy
+    scipy \
+    tabulate
 
 # ---- 3. 安裝 HLOC ----
 WORKDIR /opt

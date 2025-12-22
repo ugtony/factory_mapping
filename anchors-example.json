@@ -1,11 +1,9 @@
 {
   "brazil360": {
-    "sfm_path": "outputs-hloc/brazil360/sfm_aligned",
     "start_map_xy": [100.0, 0.0],
     "end_map_xy": [100.0, 1000.0]
   },
   "miami360": {
-    "sfm_path": "outputs-hloc/miami360/sfm_aligned",
     "start_map_xy": [500.0, 0.0],
     "end_map_xy": [500.0, 1000.0]
   }
