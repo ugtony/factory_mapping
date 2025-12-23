@@ -122,7 +122,7 @@ SFM_ALIGNED="${OUT_DIR}/sfm_aligned"
 STAGE="${OUT_DIR}/_images_stage"
 
 # Scripts
-ALIGN_SCRIPT="${PROJECT_ROOT}/scripts/align_sfm_model_z_up.py"
+ALIGN_SCRIPT="${PROJECT_ROOT}/scripts/align_linear_path.py"
 VIZ_SCRIPT="${PROJECT_ROOT}/scripts/visualize_sfm_open3d.py"
 CONVERT_360_SCRIPT="${PROJECT_ROOT}/scripts/convert360_to_pinhole.py"
 PAIRS_360_SCRIPT="${PROJECT_ROOT}/scripts/pairs_from_360.py"
@@ -291,9 +291,9 @@ else
   echo "    > Selection OK (Root: ${ROOT_IMG_COUNT}, Max: ${MAX_IMG_COUNT})."
 fi
 
-echo "[10] Align to Z-Up & Visualize"
+echo "[10] Align to Linear Path (Normalized)"
 if [ "${ALIGN_SFM}" = "1" ] && [ -d "${SFM_DIR}" ]; then
-  "${PY}" "${ALIGN_SCRIPT}" "${SFM_DIR}" "--out_dir=${SFM_ALIGNED}" > "${LOG_DIR}/align.log" 2>&1
+  "${PY}" "${ALIGN_SCRIPT}" "${SFM_DIR}" "${SFM_ALIGNED}" > "${LOG_DIR}/align.log" 2>&1
   FINAL_SFM="${SFM_ALIGNED}"
 else
   FINAL_SFM="${SFM_DIR}"
