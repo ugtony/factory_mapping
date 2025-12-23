@@ -21,11 +21,8 @@ from pathlib import Path
 from scipy.spatial.transform import Rotation
 
 # [設定路徑]
-# 取得目前檔案所在的目錄 (例如 web/ 或 scripts/)
 current_dir = Path(__file__).resolve().parent
-# 取得專案根目錄 (假設在上一層)
 project_root = current_dir.parent
-# 將專案根目錄加入 Python path 以便匯入 lib
 sys.path.append(str(project_root))
 
 try:
@@ -39,7 +36,7 @@ except ImportError as e:
 # ==================== FastAPI 設定 ====================
 app = FastAPI(title="Visual Localization Service")
 
-# 允許跨域請求 (方便前端開發)
+# 允許跨域請求
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -72,12 +69,12 @@ class LocalizeResponse(BaseModel):
     map_y: float = None
     map_yaw: float = None
     latency_ms: float = 0.0
-    # 診斷資訊 (格式化後的字典)
     diagnosis: Optional[Dict[str, Any]] = None
 
 # ==================== API Endpoint ====================
+# [Modified] 改為同步 def，讓 FastAPI 在獨立 Thread 中執行，避免卡死 Event Loop
 @app.post("/localize", response_model=LocalizeResponse)
-async def localize_endpoint(
+def localize_endpoint(
     file: UploadFile = File(...), 
     fov: Optional[float] = Form(None),
     block_filter: Optional[str] = Form(None)
@@ -86,16 +83,17 @@ async def localize_endpoint(
     定位 API
     - file: 上傳的影像檔案
     - fov: (選填) 相機視角
-    - block_filter: (選填) 指定搜尋區域，逗號分隔字串 (e.g., "blockA,blockB")
+    - block_filter: (選填) 指定搜尋區域，逗號分隔字串
     """
     if engine is None:
         raise HTTPException(status_code=503, detail="Engine not ready")
     
     t0 = time.time()
     
-    # 1. 讀取影像
+    # 1. 讀取影像 (改為同步模式)
     try:
-        contents = await file.read()
+        # 使用 file.file.read() 代替 await file.read()
+        contents = file.file.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None: 
@@ -107,11 +105,9 @@ async def localize_endpoint(
     # 2. 解析 Block Filter
     filter_list = None
     if block_filter:
-        # 將 "brazil360, miami360" 轉為 ['brazil360', 'miami360']
         filter_list = [b.strip() for b in block_filter.split(',') if b.strip()]
 
-    # 3. 呼叫定位引擎
-    # 注意：這裡假設 localization_engine.py 已經更新支援 block_filter 參數
+    # 3. 呼叫定位引擎 (內部已實作 Semaphore 保護)
     result = engine.localize(
         img, 
         fov_deg=fov, 
@@ -121,15 +117,13 @@ async def localize_endpoint(
     
     dt = (time.time() - t0) * 1000
     
-    # 4. 格式化診斷資訊 (使用 Engine 內建方法，確保與 CSV 報表一致)
+    # 4. 格式化診斷資訊
     raw_diag = result.get('diagnosis', {})
     formatted_diag = {}
     
     if hasattr(engine, 'format_diagnosis'):
         formatted_diag = engine.format_diagnosis(raw_diag)
     else:
-        # Fallback: 如果 Engine 還沒更新，直接回傳原始資料以免報錯
-        print("[Warn] engine.format_diagnosis not found. Please update localization_engine.py")
         formatted_diag = raw_diag
 
     # 5. 處理失敗情況
@@ -140,22 +134,16 @@ async def localize_endpoint(
             "diagnosis": formatted_diag
         }
     
-    # 6. 處理成功情況 (座標轉換)
-    # [Modified] 這裡的 Map 座標計算其實已經整合進 Engine 了，
-    # 但為了維持 API 回傳欄位一致性，我們直接從 result 取得 Map 座標
-    
-    # 注意：如果 localization_engine.py 已經更新計算 Map 座標，
-    # result['diagnosis'] 裡面會有 map_x, map_y 等，但 result 本身可能也有這些 key
-    # 這裡我們保留原本的邏輯做為備援，或者直接讀取 engine 回傳的 diagnosis 內容
-    
-    # 優先使用 engine 算好的 (如果有的話)
-    if 'map_x' in formatted_diag and formatted_diag['map_x'] != "":
-         p_map = [formatted_diag['map_x'], formatted_diag['map_y']]
-         map_yaw = formatted_diag['map_yaw']
-         block_name = result['block'] # 或 formatted_diag['PnP_Top1_Block']
+    # 6. 處理成功情況
+    # 優先使用 engine 格式化好的欄位 (對應 diagnosis_report.csv)
+    # 注意：這裡的 Key 需對應 format_diagnosis 輸出的 大寫開頭名稱
+    if 'Map_X' in formatted_diag and formatted_diag['Map_X'] != "":
+         p_map = [formatted_diag['Map_X'], formatted_diag['Map_Y']]
+         map_yaw = formatted_diag['Map_Yaw']
+         block_name = result['block']
          inliers = result['inliers']
     else:
-        # Fallback: 如果 Engine 沒算，這裡再算一次 (舊邏輯)
+        # Fallback 舊邏輯
         q, t = result['pose']['qvec'], result['pose']['tvec']
         trans = result['transform']
         
