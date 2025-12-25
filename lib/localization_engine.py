@@ -149,7 +149,8 @@ class LocalizationEngine:
                     failed_blocks.append(f"{block_name} (Global descriptors empty)")
                     continue
 
-                g_vecs = torch.from_numpy(np.array(g_vecs)).to(self.device).squeeze()
+                # 全域特徵留在 CPU (不呼叫 .to(self.device))
+                g_vecs = torch.from_numpy(np.array(g_vecs)).float().squeeze()
                 if g_vecs.ndim == 1: g_vecs = g_vecs.unsqueeze(0)
 
                 recon = pycolmap.Reconstruction(sfm_dir)
@@ -222,6 +223,7 @@ class LocalizationEngine:
 
             # 2. Global Feature
             q_global = self.model_extract_global({'image': img_t})['global_descriptor']
+            q_global_cpu = q_global.cpu()   #為了與 CPU 上的 DB 比對，將 Query Global 移至 CPU
             
             # 3. Local Feature
             q_local = self.model_extract_local({'image': img_g})
@@ -258,7 +260,7 @@ class LocalizationEngine:
                     if verbose: print(f"  [Log] Skipping block {name} (not in filter)")
                     continue
 
-                sim = torch.matmul(q_global, block['global_vecs'].t())
+                sim = torch.matmul(q_global_cpu, block['global_vecs'].t())
                 k_scoring = min(5, sim.shape[1])
                 if k_scoring > 0:
                     topk_vals, _ = torch.topk(sim, k=k_scoring, dim=1)
@@ -286,6 +288,7 @@ class LocalizationEngine:
             valid_block_results = []
             best_fail_stats = diag.copy()
 
+            # 遍歷候選區塊 (Candidate Blocks) 進行精確定位
             for _, block_name, sim_matrix in candidate_blocks:
                 if verbose:
                     print(f"  [Log] Checking Block: {block_name}")
@@ -295,23 +298,48 @@ class LocalizationEngine:
                 scores, indices = torch.topk(sim_matrix, k=k_val, dim=1)
                 indices = indices[0].cpu().numpy()
                 
+                # 批次讀取局部特徵 (Batch Loading) ---
+                # 先從硬碟 H5 一次性讀取所有 Top-K 影像特徵到 CPU 清單中
+                # 避免原本「讀一張、傳一次 GPU、算一次」造成的 I/O 與 Bus 等待
+                db_features_preloaded = []
+                for rank, db_idx in enumerate(indices):
+                    db_name = block['global_names'][db_idx]
+                    if db_name not in block['local_h5'] or db_name not in block['name_to_id']:
+                        continue
+                    
+                    grp = block['local_h5'][db_name]
+                    # 讀取資料到 CPU RAM (Numpy -> Tensor)
+                    kpts_db = torch.from_numpy(grp['keypoints'].__array__()).float()
+                    desc_db = torch.from_numpy(grp['descriptors'].__array__()).float()
+                    # 確保描述符維度正確 (N, 256)
+                    if desc_db.shape[0] != 256 and desc_db.shape[1] == 256:
+                        desc_db = desc_db.T
+                    
+                    db_features_preloaded.append({
+                        'rank': rank,
+                        'db_name': db_name,
+                        'kpts': kpts_db,
+                        'desc': desc_db
+                    })
+                # -----------------------------------------------
+
                 p2d_list, p3d_list = [], []
                 viz_details = {}
                 current_block_stats = {'matches_2d_sum': 0, 'matches_3d_sum': 0}
                 current_db_ranks = [] 
                 unique_matches = set()
 
-                for rank, db_idx in enumerate(indices):
-                    db_name = block['global_names'][db_idx]
-                    if db_name not in block['local_h5'] or db_name not in block['name_to_id']: continue
+                # 處理預載好的局部特徵
+                for feat in db_features_preloaded:
+                    db_name = feat['db_name']
+                    rank = feat['rank']
+                    
+                    # 搬移到 GPU 準備進行 Matching
+                    kpts_db = feat['kpts'].to(self.device)
+                    desc_db = feat['desc'].to(self.device)
                     
                     img_obj = block['recon'].images[block['name_to_id'][db_name]]
                     cam_db = block['recon'].cameras[img_obj.camera_id]
-                    
-                    grp = block['local_h5'][db_name]
-                    kpts_db = torch.from_numpy(grp['keypoints'].__array__()).float().to(self.device)
-                    desc_db = torch.from_numpy(grp['descriptors'].__array__()).float().to(self.device)
-                    if desc_db.shape[0] != 256 and desc_db.shape[1] == 256: desc_db = desc_db.T
 
                     data = {
                         'image0': torch.empty((1,1,h_orig,w_orig), device=self.device),
@@ -319,6 +347,8 @@ class LocalizationEngine:
                         'image1': torch.empty((1,1,cam_db.height,cam_db.width), device=self.device),
                         'keypoints1': kpts_db.unsqueeze(0), 'descriptors1': desc_db.unsqueeze(0)
                     }
+                    
+                    # 執行特徵匹配 (LightGlue)
                     matches = self.model_matcher(data)['matches0'][0]
                     valid = matches > -1
                     n_2d = valid.sum().item()
@@ -334,6 +364,7 @@ class LocalizationEngine:
                         if verbose: print(" (Skipped: <4 2D)")
                         continue
 
+                    # 找出對應的 3D 點
                     p3d_ids = np.array([p.point3D_id if p.has_point3D() else -1 for p in img_obj.points2D])
                     m_q = torch.where(valid)[0].cpu().numpy()
                     m_db = matches[valid].cpu().numpy()
@@ -352,15 +383,12 @@ class LocalizationEngine:
                     m_q_valid = m_q[has_3d]
                     target_ids_valid = target_ids[has_3d]
                     
-                    if len(m_q_valid) == 0: 
-                        if verbose: print(" (No Valid Points)")
-                        continue
-                    
                     new_p2d = []
                     new_p3d = []
                     kpts_np = kpts.cpu().numpy()
                     points3D_map = block['recon'].points3D
                     
+                    # 過濾重複匹配以優化 PnP 效率
                     for q_idx, tid in zip(m_q_valid, target_ids_valid):
                         q_idx = int(q_idx)
                         tid = int(tid)
@@ -377,8 +405,17 @@ class LocalizationEngine:
                     p3d_list.append(np.array(new_p3d, dtype=np.float64))
                     
                     if verbose: print(f", 3D Points = {len(new_p2d)} (Unique) -> Added")
-                    if rank == 0: viz_details['matched_db_name'] = db_name
+                    if rank == 0: 
+                        viz_details['matched_db_name'] = db_name
+                        if return_details:
+                            viz_details.update({
+                                'db_image_path': str(block['block_root'] / "images" / db_name),
+                                'kpts_query': kpts_np,
+                                'kpts_db': kpts_db.cpu().numpy(),
+                                'matches': matches.cpu().numpy()
+                            })
 
+                # 更新診斷資訊
                 if block_name == diag.get('retrieval_top1'):
                      best_fail_stats['num_matches_2d'] = current_block_stats['matches_2d_sum']
                      best_fail_stats['num_matches_3d'] = current_block_stats['matches_3d_sum']
@@ -396,6 +433,7 @@ class LocalizationEngine:
                     print(f"    [PnP Input] Total 2D-3D Correspondences: {len(p2d_concat)}")
                 
                 try:
+                    # 執行 PnP 姿態估計
                     refine_opts = pycolmap.AbsolutePoseRefinementOptions()
                     refine_opts.refine_focal_length = True
                     refine_opts.refine_extra_params = False
@@ -415,6 +453,7 @@ class LocalizationEngine:
                             success = ret.success
                             num_inliers = ret.num_inliers
 
+                        # 若 Refine 失敗，嘗試純 RANSAC
                         if not success:
                              ret_ransac = pycolmap.estimate_absolute_pose(
                                  p2d_concat, p3d_concat, camera, estimation_options={'ransac': {'max_error': 12.0}}
@@ -425,6 +464,7 @@ class LocalizationEngine:
                                 elif ret_ransac.num_inliers > 0: success = True
                                 if success: ret = ret_ransac 
 
+                        # 過濾低於門檻的 Inliers
                         if success and num_inliers < 15:
                             success = False
                             if verbose: print(f"    [Filter] Low inliers ({num_inliers} < 15), marking as Failed.")
@@ -448,9 +488,7 @@ class LocalizationEngine:
                         print(f"    [PnP Result] Failed.")
 
                     if success and qvec is not None:
-                        map_x, map_y, map_yaw = None, None, None
-                        
-                        # 1. 計算 SfM 座標系下的位置與朝向
+                        # 計算 SfM 與 地圖座標轉換
                         q_scipy = colmap_to_scipy_quat(qvec)
                         R_w2c = Rotation.from_quat(q_scipy).as_matrix()
                         R_c2w = R_w2c.T
@@ -459,18 +497,15 @@ class LocalizationEngine:
                         view_dir = R_c2w[:, 2]
                         sfm_yaw = np.degrees(np.arctan2(view_dir[1], view_dir[0]))
                         
-                        # 2. 轉換到地圖座標
                         trans = block.get('transform')
                         if trans:
                             s = trans['s']
                             theta = trans['theta']
                             t_map = trans['t']
                             R_map = trans['R']
-                            
                             p_sfm_2d = cam_center_sfm[:2]
                             p_map = s * (R_map @ p_sfm_2d) + t_map
                             map_x, map_y = float(p_map[0]), float(p_map[1])
-                            
                             m_yaw = sfm_yaw + np.degrees(theta)
                             map_yaw = float((m_yaw + 180) % 360 - 180)
                         else:
