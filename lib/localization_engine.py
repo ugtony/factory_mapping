@@ -40,7 +40,7 @@ class LocalizationEngine:
         
         self.global_conf_name = self.config.get("GLOBAL_CONF", "netvlad")
         self.default_fov = float(self.config.get("FOV_QUERY", self.config.get("FOV", 69.4)))
-        print(f"[Init] Default Query FOV: {self.default_fov}")
+        self.default_top_k = int(self.config.get("TOP_K_DB", 10))
 
         self.project_root = project_root
         
@@ -193,13 +193,14 @@ class LocalizationEngine:
                  image_arr: np.ndarray, 
                  fov_deg: float = None, 
                  return_details: bool = False, 
-                 top_k_db: int = 10, 
+                 top_k_db: int = None,
                  verbose: bool = False,
                  block_filter: list = None):
         
         # [New] 使用 Semaphore 保護整個定位流程
         with self.semaphore:
             if fov_deg is None: fov_deg = self.default_fov
+            if top_k_db is None: top_k_db = self.default_top_k
             
             h_orig, w_orig = image_arr.shape[:2]
             resize_max = 1024
